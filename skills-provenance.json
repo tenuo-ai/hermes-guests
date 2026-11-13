@@ -1,0 +1,20 @@
+{
+  "format_version": 1,
+  "bundled_skill": "hermes_guests/skills/guest-access",
+  "kind": "adapted guidance",
+  "sources": [
+    {
+      "repository": "https://github.com/tenuo-ai/tenuo",
+      "license": "Apache-2.0",
+      "paths": [
+        "skills/tenuo-warrant/SKILL.md",
+        "skills/tenuo-audit/SKILL.md"
+      ],
+      "adapted": [
+        "runtime-first tool discovery",
+        "plain-language permission proposals",
+        "reviewing the validated scope"
+      ]
+    }
+  ]
+}

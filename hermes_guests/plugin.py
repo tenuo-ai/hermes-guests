@@ -1,0 +1,2955 @@
+"""Native Hermes tools, Telegram invitation/confirmation UI, and guest transport."""
+
+from __future__ import annotations
+
+import asyncio
+import contextvars
+import json
+import logging
+import re
+import secrets
+import threading
+import time
+from datetime import datetime
+
+from .compat import in_own_profile, own_profile
+from .core import GuestsService, spent
+from .guest import NativeGuestRunner
+from .inference import resolve_model
+from .model import (
+    MAX_ACCESS_SECONDS,
+    GuestsError,
+    guest_view,
+    iso,
+    review,
+    simple_access,
+    timestamp,
+)
+from .permissions import (
+    acts_on_host,
+    review_lines,
+    short_label,
+    tool_selections,
+    validate_schema,
+)
+from .transport import LocalBroker
+from .ui import deadline
+
+FIRST_SHARE_REQUEST = re.compile(
+    r"^(?:(?:please|can you|could you)\s+)?(?:"
+    r"let\s+(?!(?:me|us|you)\b)\S.*?\s+(?:use|access|chat|talk|control|turn|read|switch|unlock)\b|"
+    r"invite\s+\S.+?\s+to\s+(?:use|access|chat|talk)\b|"
+    r"give\s+\S.+?\s+access\s+to\b|share\s+\S.+?\s+with\s+\S"
+    r")",
+    re.IGNORECASE,
+)
+
+NEVER_CHANGED = "That list has changed. Open the never-share list again from /guests_setup."
+EXTEND_AMOUNTS = (
+    (86400, "1 more day"),
+    (604800, "1 more week"),
+    (MAX_ACCESS_SECONDS, "30 more days"),
+)
+
+
+def extension_base(record, now):
+    if record["effective_status"] == "active":
+        return max(now, timestamp(record["scope"]["expires_at"]))
+    return now
+
+
+MANAGEMENT_TOOLS = {
+    "guests_discover",
+    "guests_prepare_access",
+    "guests_list_access",
+    "guests_activity",
+    "guests_repair",
+    "guests_status",
+    "guests_data",
+    "guests_never",
+}
+
+
+def actor():
+    from gateway.session_context import get_session_env
+
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    who = get_session_env("HERMES_SESSION_USER_ID", "")
+    chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "")
+    if platform != "telegram" or not who or chat_type != "dm":
+        raise GuestsError("Manage sharing in your private Telegram conversation with Hermes.")
+    return str(who)
+
+
+# Hermes lists plugin tools by their first sentence (80 characters) and finds the rest
+# by keyword, so each description leads with its purpose and carries the owner's words.
+DESCRIPTIONS = {
+    "guests_data": "Inspect guest data retention, change how long guest conversations and private memories are kept after access ends, or end all access and delete a guest profile and data. Destructive changes require the owner to confirm the review. Use action inspect, retention with retention_seconds, or delete with person.",
+    "guests_discover": "Find which of your tools can be shared and the inputs each one takes. Use before preparing access for a person: lists the shareable services, plugins and connectors with their input fields and an example entry. Search by service or capability name.",
+    "guests_prepare_access": "Give, change or end a person's access to your tools; you confirm it. Use to share with, grant, invite, allow or let a guest, user, friend, family or team member use a tool; to add or remove a permission, limit, restrict, narrow, expand, extend, renew or make access permanent with no end date; and to end, stop, cancel, block, remove or revoke someone's access (action revoke). Include presentation bindings and readable operation and resource labels for tools. Set invitation_seconds when the owner says how long the guest has to accept. Nothing changes until the owner presses Approve on the review. For deleting conversations, memory and the guest profile too, use guests_data action delete. The owner's never-share list is not changed here: use guests_never.",
+    "guests_status": "Show reviews and invitations still waiting, or expired, and how far each invitation got. Use for pending approvals, invitation progress, why someone has no access yet.",
+    "guests_list_access": "Show who has access to your tools, what each person may do, and when it ends. Use for questions about guests, users, people, status, permissions, expiry, end date and current sharing.",
+    "guests_activity": "See what you or a person has done or tried, with timestamps. Use for activity, history, log, usage or audit questions such as what did a guest or user do, which attempts were denied or blocked, and whether an allowed action finished. Use scope owner for my activity, scope all for all users, or person/share_id for one guest. With no filter, shows recent activity for everyone. Pass timezone when requested, such as America/Toronto or EST. Sends a timestamped activity card directly into this chat. Owner tool inputs are private, and authorization alone does not prove completion. Readable retained activity is bounded; limit chooses 1 to 100 recent events.",
+    "guests_never": "Propose a change to the owner's never-share list: tools and words that no guest may ever use, whatever their access allows. Use when the owner says never share, never let guests, block, forbid or allow again. kind tool blocks a whole tool; kind word blocks a word or phrase in tool inputs, everywhere or, with tool and optionally input, in one tool or one input. action remove takes an entry off. Nothing changes until the owner presses Confirm on the card sent in this chat.",
+    "guests_repair": "Check and repair sharing after a restore, a move or an error. Verifies saved access, pauses damaged grants, restores eligible ones and refreshes tool discovery; never expands or renews access.",
+}
+
+
+def local_zone():
+    """This machine's time zone name, where the system says (macOS and most Linux), so end
+    times read in the owner's own time when Hermes has no time zone set."""
+    import os
+
+    try:
+        path = os.path.realpath("/etc/localtime")
+    except OSError:
+        return ""
+    return path.split("zoneinfo/", 1)[1] if "zoneinfo/" in path else ""
+
+
+def kept_text(seconds):
+    """How long a guest's conversations and memories are kept after their access ends."""
+    from .core import GuestsService
+
+    if seconds is None:
+        return "kept until you delete them"
+    if seconds == 0:
+        return "deleted when access ends"
+    return "deleted " + GuestsService.retention_text(seconds) + " after access ends"
+
+
+def plain_words(text, limit=300):
+    """A person's own words made safe to show to someone else: one line, with no control,
+    invisible or private-use characters."""
+    import unicodedata
+
+    kept = "".join(
+        " " if c.isspace() else c
+        for c in str(text)
+        if c.isspace() or unicodedata.category(c) not in {"Cc", "Cf", "Co", "Cs", "Cn"}
+    )
+    return clip(kept, limit)
+
+
+def exact_names(known, wanted=""):
+    """The exact tool names an owner can type, each with the label shown on buttons: the
+    ones closest to `wanted`, or all of them when nothing is close. Reviews and buttons
+    show labels only, so this is where the names can be read."""
+    import difflib
+
+    names = sorted(known)
+    close = difflib.get_close_matches(str(wanted), names, n=5, cutoff=0.5)
+    shown = close or names[:30]
+
+    def labelled(name):
+        label = str(known[name])
+        return name if label == name else f"{name} ({label})"
+
+    if not names:
+        return "No tools can be shared yet."
+    return (
+        ("Did you mean: " if close else "The exact names are: ")
+        + ", ".join(labelled(n) for n in shown)
+        + (", and more" if not close and len(names) > len(shown) else "")
+        + "."
+    )
+
+
+def clip(text, limit):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def activity_text(label, rows, zone, limit=15, *, lifecycle=False):
+    """What a person did or tried, newest last, in words an owner can read."""
+    from zoneinfo import ZoneInfo
+
+    label = plain_words(label, 80)
+    finished = {r.get("call_id"): r.get("outcome") for r in rows if r.get("kind") == "outcome"}
+    # Allowed by the grant, then stopped before the service was called.
+    stopped = {r.get("call_id") for r in rows if r.get("kind") == "adapter_blocked"} - {None}
+    events = {
+        "access_activated": "Access activated",
+        "owner_access_continued": "Owner authority renewed",
+        "standing_access_continued": "Ongoing access renewed",
+        "member_adopted": "Existing member given scoped access",
+        "guest_asked_for_more": "Requested more access",
+        "delegated": "Subtask started",
+        "delegation_finished": "Subtask finished",
+        "profile_removed": "Guest data deleted",
+        "cleanup_blocked": "Guest data deletion needs attention",
+        "never_share_changed": "Never-share list changed",
+    }
+    lines = []
+    for r in rows:
+        private = r.get("kind") == "adapter_blocked" and r.get("reason") == "address-not-public"
+        when = datetime.fromtimestamp(float(r["at"]), ZoneInfo(zone)).strftime(
+            "%Y-%m-%d %H:%M:%S %Z"
+        )
+        name = plain_words(r.get("actor_label", ""), 80)
+        prefix = when + ("  " + name if name else "") + "  "
+        if r.get("kind") == "owner_tool_requested":
+            lines.append(prefix + str(r["tool"]) + " · requested")
+            continue
+        if r.get("kind") not in {"decision", "never_share_blocked"} and not private:
+            if not lifecycle:
+                continue
+            event = events.get(r.get("kind"))
+            if r.get("kind") == "owner_approved":
+                event = {
+                    "replace": "Approved access",
+                    "revoke": "Approved ending access",
+                    "delete": "Approved guest data deletion",
+                    "retention": "Approved guest data retention",
+                }.get(r.get("action"), "Approved sharing change")
+            if event:
+                target = plain_words(r.get("subject_label") or r.get("person") or "", 80)
+                lines.append(prefix + event + (" — " + target if target else ""))
+            continue
+        if private:
+            result = "refused (not a public address)"
+        elif r.get("kind") == "never_share_blocked":
+            result = "refused (your never-share list)"
+        elif r.get("decision") == "ALLOW" and r.get("call_id") in stopped:
+            result = "refused before it ran"
+        elif r.get("decision") == "ALLOW":
+            result = {"returned": "done", None: "allowed, no result recorded"}.get(
+                finished.get(r.get("call_id")), "allowed, " + str(finished.get(r.get("call_id")))
+            )
+        else:
+            result = "refused"
+        lines.append(
+            prefix + str(r.get("tool")) + " " + clip(r.get("inputs", ""), 90) + ": " + result
+        )
+    if not lines:
+        return "No matching recorded activity for " + label + "."
+    more = len(lines) - limit
+    return (
+        "Activity for "
+        + label
+        + " — "
+        + zone
+        + (" (latest " + str(limit) + " of " + str(len(lines)) + ")" if more > 0 else "")
+        + "\n\n"
+        + "\n".join(lines[-limit:])
+    )
+
+
+def owner_identity(ctx):
+    from hermes_cli.config import get_env_value
+
+    configured = ctx.get_config("owner_id", "")
+    values = [
+        x.strip()
+        for x in str(get_env_value("TELEGRAM_ALLOWED_USERS") or "").split(",")
+        if x.strip()
+    ]
+    from gateway.pairing import PairingStore
+
+    paired = PairingStore().list_approved("telegram")
+    if configured:
+        owner = str(configured)
+    else:
+        admitted = {value for value in values if value.isdigit()} | {
+            str(entry.get("user_id", ""))
+            for entry in paired
+            if str(entry.get("user_id", "")).isdigit()
+        }
+        if len(admitted) != 1:
+            raise GuestsError(
+                "Choose the sharing owner. Set owner_id in Hermes Guests settings to one "
+                "of this bot's existing numeric Telegram user IDs, then send /guests_setup."
+            )
+        owner = next(iter(admitted))
+    if not owner.isdigit():
+        raise GuestsError("The configured owner identity is invalid.")
+    # Guests are intercepted by this plugin, never added to broad native pairing. People the
+    # bot already admits are taken over at setup (see other_people); "everyone" cannot be.
+    allow_all = str(get_env_value("TELEGRAM_ALLOW_ALL_USERS") or "").lower()
+    if allow_all in {"1", "true", "yes"}:
+        raise GuestsError(
+            "This bot admits every Telegram user, so there is no list of people to give scoped access to. Turn off TELEGRAM_ALLOW_ALL_USERS and list the people you allow, then send /guests_setup."
+        )
+    if owner not in values and not any(str(x.get("user_id", "")) == owner for x in paired):
+        raise GuestsError(
+            "Approve this owner through Hermes's native Telegram pairing or owner allowlist before enabling Hermes Guests."
+        )
+    return owner
+
+
+def other_people(ctx, owner):
+    """The people besides the owner whom the bot itself admits on Telegram: [{"id", "label"}].
+    Once sharing is on, Hermes Guests answers them in place of the unrestricted agent."""
+    from gateway.pairing import PairingStore
+    from hermes_cli.config import get_env_value
+
+    found = {}
+    for value in str(get_env_value("TELEGRAM_ALLOWED_USERS") or "").split(","):
+        value = value.strip()
+        if value.isdigit() and value != owner:
+            found[value] = value
+    for entry in PairingStore().list_approved("telegram"):
+        uid = str(entry.get("user_id", ""))
+        if uid.isdigit() and uid != owner:
+            found[uid] = str(
+                entry.get("user_name") or entry.get("username") or entry.get("name") or uid
+            )
+    return [{"id": uid, "label": label} for uid, label in sorted(found.items())]
+
+
+def selected_provider():
+    """The provider Hermes picks when the owner left the choice to Hermes."""
+    from hermes_cli.auth import AuthError, resolve_provider
+
+    try:
+        return resolve_provider("auto")
+    except AuthError as exc:
+        raise GuestsError("Choose a Hermes model before sharing.") from exc
+
+
+def native_runtime():
+    from agent.secret_scope import get_secret
+    from hermes_cli.config import load_config_readonly
+
+    return resolve_model(load_config_readonly(), get_secret, selected_provider)
+
+
+def parse_result(result):
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except ValueError:
+            return {"error": "The connected service returned an unsupported response."}
+    if isinstance(result, dict) and "result" in result:
+        return result["result"]
+    return result
+
+
+class GuestsPlugin:
+    def __init__(self, ctx, *, service=None, runner=None):
+        self.ctx = ctx
+        self.service = service
+        self.runner = runner
+        self.broker = None
+        self.app = None
+        self.loop = None
+        self.pending_setup = None
+        self.wizard = None
+        self._asking = {}  # guest id -> until when their next message is a request for more access
+        self.pending_recovery = None
+        self._maintenance_task = None
+        self._guest_tasks = {}
+        self._send_locks = {}
+        self._context = contextvars.copy_context()
+        self._ensure_lock = threading.RLock()
+
+    def ensure(self):
+        with self._ensure_lock:
+            return self._ensure()
+
+    def _ensure(self):
+        if self.service is None:
+            owner = owner_identity(self.ctx)
+            dispatch_context = self._context.copy()
+
+            def dispatch(tool, args, envelope):
+                return parse_result(
+                    dispatch_context.copy().run(
+                        in_own_profile,
+                        self.ctx.dispatch_tool,
+                        tool,
+                        args,
+                        tenuo_envelope=envelope,
+                    )
+                )
+
+            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+            from hermes_time import get_timezone_name
+
+            zone = (
+                self.ctx.get_config("timezone", "") or get_timezone_name() or local_zone() or "UTC"
+            )
+            try:
+                ZoneInfo(zone)
+            except (ZoneInfoNotFoundError, ValueError):
+                zone = "UTC"
+            self.service = GuestsService(
+                self.ctx.state,
+                owner,
+                dispatch=dispatch,
+                timezone=zone,
+                tool_resolver=self.resolve_tool,
+                **{
+                    name: self.ctx.get_config(name, default)
+                    for name, default in (
+                        ("review_seconds", 600),
+                        ("invitation_seconds", 1800),
+                        ("claim_seconds", 600),
+                        ("guest_data_retention_seconds", None),
+                    )
+                },
+            )
+        if self.runner is None:
+            self.broker = LocalBroker(self.service)
+            self.runner = NativeGuestRunner(self.service, self.broker, native_runtime)
+        return self.service
+
+    def installed_tools(self):
+        from .compat import native_definitions
+
+        return native_definitions()
+
+    def resolve_tool(self, name):
+        from tools.registry import registry
+
+        if acts_on_host(name, registry.get_toolset_for_tool(name)):
+            return None
+        for raw in self.installed_tools():
+            spec = raw.get("function", raw)
+            if spec.get("name") == name:
+                try:
+                    return validate_schema(spec)
+                except GuestsError:
+                    return None
+        return None
+
+    def discover(self, who, *, query="", cursor=0):
+        service = self.ensure()
+        service.owner(who)
+        from tools.registry import registry
+
+        available, excluded = {}, []
+        connected = set()  # usable by the owner, whether or not it may be shared
+        never = service.never()
+        for raw in self.installed_tools():
+            spec = raw.get("function", raw)
+            name = spec.get("name", "")
+            try:
+                if acts_on_host(name, registry.get_toolset_for_tool(name)):
+                    raise GuestsError(
+                        "Host execution, personal memory, and configuration tools need a sandbox before sharing."
+                    )
+                checked = validate_schema(spec)
+                connected.add(name)
+                if never.blocks_tool(name):
+                    raise GuestsError("On the owner's never-share list.")
+                available[name] = checked
+            except GuestsError as exc:
+                excluded.append({"name": name, "reason": str(exc)})
+        light_tools = ("ha_get_state", "ha_call_service", "ha_list_entities")
+        # The catalog is the owner's own list of lights. The never-share list decides what
+        # is offered to guests, not what the owner's catalog holds: existing access is
+        # checked against the catalog, so it must not empty when a tool is listed.
+        lights = {}
+        if all(x in connected for x in light_tools):
+            data = parse_result(self.ctx.dispatch_tool("ha_list_entities", {"domain": "light"}))
+            entities = data.get("entities", []) if isinstance(data, dict) else []
+            for entity in entities:
+                eid = entity.get("entity_id", "")
+                attributes = entity.get("attributes", {}) or {}
+                if eid.startswith("light."):
+                    lights[eid] = {
+                        "name": entity.get("friendly_name")
+                        or entity.get("name")
+                        or attributes.get("friendly_name")
+                        or eid,
+                        "group": bool(attributes.get("entity_id") or entity.get("group")),
+                    }
+        service.catalog = lights
+        with service.ledger.transaction() as db:
+            db["setup"]["catalog"] = lights
+        # Match on any word of the query; a query that matches nothing still lists everything,
+        # so a loosely worded search never hides the catalog.
+        words = [w for w in query.lower().replace("_", " ").split() if len(w) > 2]
+
+        def hit(name, spec):
+            text = (name + " " + spec["description"]).lower().replace("_", " ")
+            return not words or any(w in text or w.rstrip("s") in text for w in words)
+
+        matches = sorted((v for k, v in available.items() if hit(k, v)), key=lambda x: x["name"])
+        if not matches:
+            matches = sorted(available.values(), key=lambda x: x["name"])
+        from .permissions import describe_inputs, example_entry
+
+        matches = [
+            {**v, "inputs": describe_inputs(v), "example": example_entry(v)} for v in matches
+        ]
+        cursor = max(0, int(cursor))
+        return {
+            "lights": lights if all(x in available for x in light_tools) else {},
+            "research_available": all(x in available for x in ("web_search", "web_extract")),
+            "tools": matches[cursor : cursor + 10],
+            "next_cursor": cursor + 10 if len(matches) > cursor + 10 else None,
+            "catalog": [
+                {"name": k, "description": v["description"].split("\n")[0]}
+                for k, v in sorted(available.items())
+            ],
+            "excluded": excluded,
+            "how_to_prepare": {
+                "call": "guests_prepare_access",
+                "arguments": {
+                    "person": "<their name>",
+                    "scope": {
+                        "tools": [
+                            "<copy a tool's example from above and narrow each input's rule>"
+                        ],
+                        "duration_seconds": 3600,
+                    },
+                },
+                "time_limit": "Inside scope, give exactly one of duration_seconds, expires_at, or until_ended: true for access with no end date.",
+                "rules": 'Every required input of a tool needs one rule: {"equals": value}, {"one_of": [values]}, {"range": [low, high]} or {"any": true}. Inputs left out are not available to the guest.',
+            },
+            "guidance": "Use discovered schemas and include presentation action/resource bindings, readable operation labels and verified resource names in new proposals. Keep different action/resource pairs in separate complete tool rules. For an acceptance deadline, pass invitation_seconds to guests_prepare_access separately from access duration_seconds. Resource presets are optional.",
+        }
+
+    def verify_lights(self, who, selected):
+        """Summarized HA catalogs omit group membership; inspect selected states."""
+        service = self.ensure()
+        service.owner(who)
+        if not isinstance(selected, list) or len(selected) > 20:
+            raise GuestsError("Choose up to twenty individual lights.")
+        for entity in selected:
+            if not isinstance(entity, str) or entity not in service.catalog:
+                raise GuestsError("Choose a discovered individual light.")
+            state = parse_result(self.ctx.dispatch_tool("ha_get_state", {"entity_id": entity}))
+            if (
+                not isinstance(state, dict)
+                or state.get("entity_id") != entity
+                or not isinstance(state.get("attributes"), dict)
+            ):
+                raise GuestsError(
+                    "I couldn't verify this light. Reconnect Home Assistant and try again."
+                )
+            group = bool(state["attributes"].get("entity_id"))
+            service.catalog[entity]["group"] = group
+            if group:
+                raise GuestsError(
+                    "This light controls a group. Choose its individual lights instead."
+                )
+        with service.ledger.transaction() as db:
+            db["setup"]["catalog"] = service.catalog
+
+    def existing_access(self, who, person, ended=False):
+        """The one access this name or Telegram ID refers to, if any. A request about
+        someone who already has access changes that access; it must not quietly create a
+        second grant beside it. Access that has run out still belongs to the same person,
+        so extending it updates it. With `ended`, access the owner ended counts too (for
+        reading what someone did). Several matches are reported, never guessed."""
+        wanted = str(person or "").strip().casefold()
+        if not wanted:
+            return None
+        matches = [
+            r
+            for r in self.ensure().list_access(who)
+            if wanted in {str(r.get("label", "")).casefold(), str(r.get("guest_id", ""))}
+        ]
+        # Who the name could mean is settled before choosing between their records: one
+        # person's lapsed access must never be mistaken for another person's active access.
+        relevant = (
+            matches
+            if ended
+            else [r for r in matches if r.get("data_deletion_requested_at") is None]
+        )
+        if len({str(r.get("guest_id")) for r in relevant}) > 1:
+            raise GuestsError(
+                "More than one person is called "
+                + str(person).strip()[:40]
+                + ". Use their Telegram ID instead."
+            )
+        for group in (
+            [r for r in relevant if r.get("effective_status") == "active"],
+            [r for r in relevant if r.get("status") != "revoked"],
+            relevant,
+        ):
+            if group:
+                return max(group, key=lambda r: r.get("updated_at", 0))["id"]
+        return None
+
+    async def activity_card(self, who, selected, share_id=None, zone=None, limit=50):
+        """Send the timestamped activity card for one guest ("guest"), the owner ("owner")
+        or everyone ("all"). Returns the rows shown and how many events were read."""
+        from zoneinfo import ZoneInfo
+
+        service = self.ensure()
+        zone = zone or service.zone
+        rows = service.activity(who, share_id, scope=selected, limit=limit)
+        records = service.list_access(who)
+        labels = {r["id"]: r["label"] for r in records}
+        actors = {r["guest_id"]: r["label"] for r in records}
+        actors.update({service.owner_id: "Owner", "": "System"})
+        result = [
+            dict(
+                row,
+                timestamp=iso(row["at"]),
+                local_time=datetime.fromtimestamp(row["at"], ZoneInfo(zone)).isoformat(
+                    timespec="seconds"
+                ),
+                actor_label=actors.get(str(row.get("actor", "")), "Unknown"),
+                subject_label=labels.get(row.get("share_id"), row.get("person", "")),
+            )
+            for row in rows
+        ]
+        label = {"owner": "owner", "all": "everyone"}.get(selected, labels.get(share_id, "guest"))
+        await self.send(
+            who,
+            activity_text(label, result, zone, limit=limit, lifecycle=True)
+            + f"\n\nBased on {len(rows)} recent retained events (limit {limit}). Owner inputs are omitted. An allowed call does not establish completion. Conversation history is separate.",
+        )
+        return result, len(rows)
+
+    async def extend_choices(self, who, record):
+        """Buttons for more time on someone's access, each leading to the usual review."""
+        if record["scope"].get("until_ended"):
+            raise GuestsError(record["label"] + "'s access has no end date already.")
+        if record.get("data_deletion_requested_at") is not None:
+            raise GuestsError("This guest's data was marked for deletion. Send a fresh invitation.")
+        now = self.ensure().clock()
+        base = extension_base(record, now)
+        callback = f"hs:Y:{record['id']}:{record['revision']}:"
+        options = [
+            (label, callback + str(seconds))
+            for seconds, label in EXTEND_AMOUNTS
+            if base + seconds <= now + MAX_ACCESS_SECONDS
+        ]
+        options.append(("No end date", callback + "0"))
+        await self.send(
+            who,
+            "How much more time for "
+            + record["label"]
+            + "? Timed access can end up to 30 days from now. You'll see the full review before anything changes.",
+            [options[i : i + 2] for i in range(0, len(options), 2)],
+        )
+
+    async def extend(self, who, identifier):
+        """Prepare the review for more time: from the current end time, or from now if
+        access has already ended."""
+        parts = identifier.split(":")
+        if (
+            len(parts) != 3
+            or not parts[1].isdigit()
+            or parts[2] not in {"0", *(str(seconds) for seconds, _ in EXTEND_AMOUNTS)}
+        ):
+            raise GuestsError("Open the guest in /guests and choose Extend again.")
+        sid, revision, amount = parts
+        service = self.ensure()
+        record = service.get_access(who, sid)
+        if str(record["revision"]) != revision or record["scope"].get("until_ended"):
+            raise GuestsError(
+                "Access changed since that menu. Open the guest in /guests and choose Extend again."
+            )
+        if amount == "0":
+            timing = {"until_ended": True}
+        else:
+            now = service.clock()
+            ends = extension_base(record, now) + int(amount)
+            if ends > now + MAX_ACCESS_SECONDS:
+                raise GuestsError(
+                    "That would put the end time more than 30 days from now. Choose Extend again."
+                )
+            timing = {"expires_at": iso(ends)}
+        scope = self.keep_current(who, sid, timing)
+        scope["guest_memory"] = bool(record["scope"].get("guest_memory"))
+        await self.proposal_card(
+            service.prepare(who, record["label"], scope, share_id=sid, revision=record["revision"])
+        )
+
+    def keep_current(self, who, share_id, scope):
+        """A change that names no permissions keeps the ones the person has: "another
+        week" or "no end date" is about time only. The owner still reviews the whole result."""
+        scope = dict(scope) if isinstance(scope, dict) else {}
+        if any(key in scope for key in ("tools", "lights", "research", "chat_only")):
+            return scope  # permissions were named, even as "none": that is what gets reviewed
+        try:
+            current = self.ensure().get_access(who, share_id)["scope"]
+        except GuestsError:
+            return scope
+        if current.get("chat_only"):
+            scope["chat_only"] = True
+        else:
+            scope["tools"] = tool_selections(current.get("tools", []))
+            scope["lights"] = list(current.get("lights", []))
+            scope["research"] = bool(current.get("research"))
+        if not any(k in scope for k in ("duration_seconds", "expires_at", "until_ended")):
+            scope.update(
+                {"until_ended": True}
+                if current.get("until_ended")
+                else {"expires_at": current["expires_at"]}
+            )
+        return scope
+
+    async def display_name(self, user_id, fallback):
+        """What Telegram calls this person, so the owner can refer to them by name."""
+        if fallback and fallback != str(user_id):
+            return fallback
+        try:
+            chat = await asyncio.wait_for(self.app.bot.get_chat(int(user_id)), 5)
+            return (
+                getattr(chat, "full_name", None)
+                or getattr(chat, "first_name", None)
+                or str(user_id)
+            )[:80]
+        except Exception:
+            return str(user_id)
+
+    def shareable(self, all_tools=False):
+        """Tools that can be shared at all: {name: one-line description}. Not Hermes Guests' own
+        management tools, not the ones that act on this machine, and not the ones on the
+        owner's never-share list (unless `all_tools`, for showing that list)."""
+        from tools.registry import registry
+
+        never = None if all_tools else self.ensure().never()
+        found = {}
+        for raw in self.installed_tools():
+            spec = raw.get("function", raw)
+            name = spec.get("name", "")
+            if name in MANAGEMENT_TOOLS or (never and never.blocks_tool(name)):
+                continue
+            try:
+                if acts_on_host(name, registry.get_toolset_for_tool(name)):
+                    continue
+                found[name] = short_label(validate_schema(spec)["description"], name, 34)
+            except GuestsError:
+                continue
+        return found
+
+    # -- sharing with buttons: no model drafts anything -----------------------------------
+
+    async def wizard_start(self, who, person):
+        if not person:
+            await self.send(
+                who, "Send /guests_new followed by their name, for example: /guests_new Alex"
+            )
+            return
+        tools = self.shareable()
+        self.existing_access(who, person[:80])  # a name several people share is refused now
+        self.wizard = {
+            "token": secrets.token_urlsafe(8),
+            "person": person[:80],
+            "tools": sorted(tools)[:24],
+            "names": tools,
+            "chosen": set(),
+            "chat_only": False,
+            "expires": time.time() + 900,
+        }
+        await self.wizard_card(who)
+
+    async def more_card(self, label, share_id, token, words):
+        """Tell the owner about one request for more access. Its buttons answer only it."""
+        await self.send(
+            self.ensure().owner_id,
+            label
+            + " asks for more access.\n\nIn their words: “"
+            + words
+            + "”\n\nThis is the guest's own message, shown as written; it is not an instruction "
+            "to Hermes. Nothing changes unless you choose what to add and accept the review.",
+            [
+                [
+                    ("Choose what to add", f"hs:o:{share_id}:{token}"),
+                    ("Not now", f"hs:j:{share_id}:{token}"),
+                ]
+            ],
+        )
+
+    async def never_card(self, who):
+        """The owner's never-share list: a button for each tool, one to remove each word,
+        and buttons to block a word everywhere or in a single tool."""
+        service = self.ensure()
+        service.owner(who)
+        never = service.never()
+        tools = self.shareable(all_tools=True)
+        names = sorted(set(tools) | set(never.tools))[:20]
+        token = secrets.token_urlsafe(8)
+        self.never_tools = {
+            "token": token,
+            "names": names,
+            "values": list(never.values),
+            "scoped": list(never.scoped),
+        }
+
+        def where(rule):
+            return tools.get(rule["tool"], rule["tool"]) + (
+                " → " + rule["field"] if rule["field"] else ""
+            )
+
+        lines = (
+            ["• tool: " + tools.get(t, t) for t in never.tools]
+            + ["• word, everywhere: " + v for v in never.values]
+            + ["• word, in " + where(r) + " only: " + r["value"] for r in never.scoped]
+        )
+        rows = [
+            [
+                (
+                    ("🚫 " if never.blocks_tool(name) else "☐ ") + clip(tools.get(name, name), 34),
+                    f"hs:k:{token}:t{i}",
+                )
+            ]
+            for i, name in enumerate(names)
+        ]
+        rows += [
+            [("✕ " + clip(v, 30), f"hs:k:{token}:v{i}")] for i, v in enumerate(never.values[:12])
+        ]
+        rows += [
+            [("✕ " + clip(r["value"], 16) + " · " + clip(where(r), 18), f"hs:k:{token}:x{i}")]
+            for i, r in enumerate(never.scoped[:12])
+        ]
+        rows.append([("＋ Block a word everywhere", f"hs:k:{token}:a")])
+        if names:
+            rows.append([("＋ Block a word in one tool", f"hs:k:{token}:s")])
+        crowded = (
+            len(never.values) > 12
+            or len(never.scoped) > 12
+            or len(set(tools) | set(never.tools)) > 20
+        )
+        example = (
+            f"“never share {max(tools.keys() | set(never.tools))}”"
+            if names
+            else "“never let guests use this word”"
+        )
+        await self.send(
+            who,
+            "Never shared with anyone, whatever is asked and however access was set up:\n"
+            + ("\n".join(lines) if lines else "(nothing yet)")
+            + "\n\nTap a tool to add or remove it, or ✕ to take a word off. "
+            "Block a word such as a lock, a room, a person or a folder everywhere it could "
+            "appear, or in one tool only."
+            + (
+                "\nNot everything has a button. For the rest, tell me in words, for example "
+                + example
+                + " or “allow that word again”."
+                if crowded
+                else ""
+            )
+            + "\n\nChanges apply at once, also to people who already have access.",
+            rows,
+        )
+
+    async def never_press(self, who, identifier):
+        service = self.ensure()
+        token, _, step = identifier.partition(":")
+        card = getattr(self, "never_tools", None)
+        if not card or token != card["token"]:
+            raise GuestsError(NEVER_CHANGED)
+        kind, index = step[:1], step[1:]
+        tools = self.shareable(all_tools=True)
+        if kind == "s":
+            await self.send(
+                who,
+                "Block a word in which tool?",
+                [
+                    [(clip(tools.get(n, n), 34), f"hs:k:{token}:p{i}")]
+                    for i, n in enumerate(card["names"])
+                ],
+            )
+            return
+        if kind == "a":
+            self._name_prompt = None
+            self._never_word = {"tool": None, "until": time.time() + 600}
+            await self.send(
+                who,
+                "Send the word or phrase guests may never use in any tool, as your next "
+                "message. Send /cancel to skip.",
+            )
+            return
+        if not index.isdigit():
+            raise GuestsError(NEVER_CHANGED)
+        i = int(index)
+        if kind == "p" and i < len(card["names"]):
+            name = card["names"][i]
+            self._name_prompt = None
+            self._never_word = {"tool": name, "until": time.time() + 600}
+            await self.send(
+                who,
+                "Send the word or phrase guests may never use with “"
+                + tools.get(name, name)
+                + "”, as your next message. Send /cancel to skip.",
+            )
+            return
+        if kind == "t" and i < len(card["names"]):
+            name = card["names"][i]
+            service.never_set(who, "tools", name, not service.never().blocks_tool(name))
+        elif kind == "v" and i < len(card["values"]):
+            service.never_set(who, "values", card["values"][i], False)
+        elif kind == "x" and i < len(card["scoped"]):
+            rule = card["scoped"][i]
+            service.never_set(
+                who, "scoped", rule["value"], False, tool=rule["tool"], field=rule["field"] or None
+            )
+        else:
+            raise GuestsError(NEVER_CHANGED)
+        await self.never_card(who)
+
+    def never_change(self, args):
+        """Check a never-share change asked for in words and say exactly what it does.
+        Nothing is saved here: the owner confirms it with a button."""
+        from .never import checked_item
+
+        service = self.ensure()
+        action, kind = args.get("action"), args.get("kind")
+        value = str(args.get("value") or "").strip()
+        tool = str(args.get("tool") or "").strip()
+        field = str(args.get("input") or "").strip()
+        if action not in {"add", "remove"} or kind not in {"tool", "word"} or not value:
+            raise GuestsError("Say whether to add or remove a tool or a word, and which one.")
+        never = service.never()
+        known = self.shareable(all_tools=True)
+        adding = action == "add"
+        locations = None
+        if kind == "tool":
+            if tool or field:
+                raise GuestsError("A whole tool is blocked by its name alone.")
+            if adding and value not in known:
+                raise GuestsError(
+                    "No shareable tool is called " + value[:40] + ". " + exact_names(known, value)
+                )
+            if adding == never.blocks_tool(value):
+                raise GuestsError(
+                    value[:40]
+                    + (" is already" if adding else " is not")
+                    + " on the never-share list."
+                )
+            text = (
+                "Never share the tool " if adding else "Allow sharing the tool again: "
+            ) + known.get(value, value)
+        else:
+            if field and not tool:
+                raise GuestsError("Name the tool that input belongs to.")
+            if tool and tool not in known and adding:
+                raise GuestsError(
+                    "No shareable tool is called " + tool[:40] + ". " + exact_names(known, tool)
+                )
+            if adding:
+                checked_item("scoped" if tool else "values", value)
+                schema = self.resolve_tool(tool) if field else None
+                inputs = ((schema or {}).get("function", schema or {}).get("parameters") or {}).get(
+                    "properties"
+                ) or {}
+                if field and field not in inputs:
+                    raise GuestsError(
+                        f"{tool} has no input called {field}. Its inputs: "
+                        + ", ".join(sorted(inputs))
+                        + "."
+                    )
+            where = (
+                "in any tool"
+                if not tool
+                else "in " + known.get(tool, tool) + (" → " + field if field else "")
+            )
+            if adding:
+                text = "Never let guests use “" + value + "” " + where
+            else:
+                locations = never.word_locations(value, tool, field)
+                if not locations:
+                    raise GuestsError("“" + value[:40] + "” is not blocked " + where + ".")
+                text = "Remove the never-share rule for “" + value + "”"
+        return {
+            "action": action,
+            "kind": kind,
+            "value": value,
+            "tool": tool,
+            "field": field,
+            "text": text,
+            "locations": locations,
+        }
+
+    async def never_confirm_card(self, who, change):
+        token = secrets.token_urlsafe(8)
+        pending = self.pending_never = {
+            "token": token,
+            "change": change,
+            "expires": time.time() + self.ensure().review_seconds,
+        }
+        locations = change["locations"]
+        scope = ""
+        if locations:
+            scope = "\n\nRemove from:\n" + "\n".join(
+                "• "
+                + (tool + (" → " + field if field else " (all inputs)") if tool else "All tools")
+                for tool, field in locations
+            )
+        message = await self.send(
+            who,
+            change["text"]
+            + "?"
+            + scope
+            + "\n\nThis applies at once to everyone's access, including access already given.",
+            [[("Confirm", "hs:K:" + token), ("Cancel", "hs:K:" + token + ":n")]],
+        )
+        pending["message_id"] = message.message_id
+
+    async def never_confirmed(self, who, identifier, message_id):
+        token, _, no = identifier.partition(":")
+        pending = getattr(self, "pending_never", None)
+        if (
+            not pending
+            or token != pending["token"]
+            or pending["expires"] <= time.time()
+            or pending.get("message_id") != message_id
+        ):
+            raise GuestsError(
+                "That change has expired and nothing was changed. Ask again, or open the "
+                "never-share list from /guests_setup."
+            )
+        self.pending_never = None
+        if no:
+            await self.send(who, "Nothing changed.")
+            return
+        service, change = self.ensure(), pending["change"]
+        adding, value = change["action"] == "add", change["value"]
+        if change["kind"] == "tool":
+            service.never_set(who, "tools", value, adding)
+        elif adding:
+            service.never_set(
+                who,
+                "scoped" if change["tool"] else "values",
+                value,
+                adding,
+                tool=change["tool"] or None,
+                field=change["field"] or None,
+            )
+        else:
+            service.never_remove_word(
+                who, value, change["tool"], change["field"], change["locations"]
+            )
+        await self.never_card(who)
+
+    async def change_start(self, who, record):
+        """Change what someone already has, with the same buttons. Tools they have stay
+        exactly as approved; a tool added here is offered with all of its inputs."""
+        service = self.ensure()
+        if not service._fresh(record):
+            raise GuestsError(
+                record["label"] + "'s access is not active. Use /guests_new to share again."
+            )
+        tools = self.shareable()
+        current = {}  # each tool with every rule set approved for it
+        for selection in tool_selections(record["scope"].get("tools", [])):
+            current.setdefault(selection["name"], []).append(selection)
+        covered = (
+            {"ha_get_state", "ha_call_service"} if record["scope"].get("lights") else set()
+        ) | ({"web_search", "web_extract"} if record["scope"].get("research") else set())
+        names = {n: label for n, label in tools.items() if n not in covered}
+        for name, entry in current.items():
+            names.setdefault(name, name)
+        self.wizard = {
+            "token": secrets.token_urlsafe(8),
+            "person": record["label"],
+            # Everything they have is always listed, so any of it can be unticked; other
+            # tools fill the remaining places.
+            "tools": sorted(current)
+            + [n for n in sorted(names) if n not in current][: max(0, 24 - len(current))],
+            "names": names,
+            "chosen": set(current),
+            "chat_only": bool(record["scope"].get("chat_only")),
+            "expires": time.time() + 900,
+            "share_id": record["id"],
+            "revision": record["revision"],
+            "current": current,
+            # What they have as a preset stays ticked; unticking takes that preset away.
+            "presets": {key: True for key in ("lights", "research") if record["scope"].get(key)},
+            "lights": len(record["scope"].get("lights") or []),
+        }
+        await self.wizard_card(who)
+
+    async def wizard_card(self, who):
+        w = self.wizard
+        rows = [[(("☑ " if w.get("chat_only") else "☐ ") + "Chat only", f"hs:w:{w['token']}:c")]]
+        rows += [
+            [
+                (
+                    ("☑ " if name in w["chosen"] else "☐ ") + w["names"][name],
+                    f"hs:w:{w['token']}:t{i}",
+                )
+            ]
+            for i, name in enumerate(w["tools"])
+        ]
+        changing = "share_id" in w
+        for key, kept in (w.get("presets") or {}).items():
+            label = (
+                f"Lights ({w.get('lights', 0)} chosen)"
+                if key == "lights"
+                else "Web search and reading"
+            )
+            rows.append([(("☑ " if kept else "☐ ") + label, f"hs:w:{w['token']}:{key[0].upper()}")])
+        rows.append([("Next: review" if changing else "Next: how long", f"hs:w:{w['token']}:n")])
+        await self.send(
+            who,
+            (
+                f"Change what {w['person']} may use. Tap to add or remove, then Next. The end time stays the same."
+                if changing
+                else f"Share with {w['person']}. Tap what they may use, then Next."
+            )
+            + (
+                ""
+                if len(w["names"]) <= 24
+                else "\n(The first 24 tools are shown; ask me in words for the others.)"
+            ),
+            rows,
+        )
+
+    async def wizard_press(self, who, identifier):
+        service = self.ensure()
+        service.owner(who)
+        token, _, step = identifier.partition(":")
+        w = self.wizard
+        if not w or token != w["token"] or w["expires"] <= time.time():
+            raise GuestsError(
+                "That choice has expired. Send /guests_new and their name to start again."
+            )
+        if step == "c":
+            w["chat_only"] = not w.get("chat_only", False)
+            w["chosen"].clear()
+            for key in w.get("presets", {}):
+                w["presets"][key] = False
+            await self.wizard_card(who)
+        elif step in {"L", "R"} and {"L": "lights", "R": "research"}[step] in (
+            w.get("presets") or {}
+        ):
+            w["chat_only"] = False
+            key = {"L": "lights", "R": "research"}[step]
+            w["presets"][key] = not w["presets"][key]
+            await self.wizard_card(who)
+        elif step.startswith("t") and step[1:].isdigit() and int(step[1:]) < len(w["tools"]):
+            w["chat_only"] = False
+            w["chosen"] ^= {w["tools"][int(step[1:])]}
+            await self.wizard_card(who)
+        elif step == "n" and "share_id" in w:
+            from .permissions import example_entry
+
+            record = service.get_access(who, w["share_id"])
+            now = record["scope"]
+            scope = (
+                {"chat_only": True}
+                if w.get("chat_only")
+                else {
+                    "tools": [
+                        selection
+                        for n in sorted(w["chosen"])
+                        for selection in (
+                            w["current"].get(n)
+                            or [example_entry(validate_schema(self.resolve_tool(n)))]
+                        )
+                    ],
+                    "lights": list(now.get("lights", [])) if w["presets"].get("lights") else [],
+                    "research": bool(now.get("research")) and bool(w["presets"].get("research")),
+                }
+            )
+            if not (
+                scope.get("chat_only")
+                or scope.get("tools")
+                or scope.get("lights")
+                or scope.get("research")
+            ):
+                raise GuestsError("Choose Chat only or at least one tool, or use End access.")
+            scope.update(
+                {"until_ended": True}
+                if now.get("until_ended")
+                else {"expires_at": now["expires_at"]}
+            )
+            self.wizard = None
+            # The rules kept here were read when the picker opened. If the access changed
+            # since, preparing refuses, so an older and broader rule is never put back.
+            await self.proposal_card(
+                service.prepare(
+                    who, w["person"], scope, share_id=w["share_id"], revision=w["revision"]
+                )
+            )
+        elif step == "n":
+            if not w["chosen"] and not w.get("chat_only"):
+                raise GuestsError("Choose Chat only or at least one tool first.")
+            await self.send(
+                who,
+                f"How long may {w['person']} use "
+                + ("it" if len(w["chosen"]) == 1 else "these")
+                + "?",
+                [
+                    [("1 hour", f"hs:w:{token}:d3600"), ("1 day", f"hs:w:{token}:d86400")],
+                    [("1 week", f"hs:w:{token}:d604800"), ("30 days", f"hs:w:{token}:d2592000")],
+                    [("No end date", f"hs:w:{token}:d0")],
+                ],
+            )
+        elif step.startswith("d") and step[1:].isdigit() and (w["chosen"] or w.get("chat_only")):
+            from .permissions import example_entry
+
+            seconds = int(step[1:])
+            scope = (
+                {"chat_only": True}
+                if w.get("chat_only")
+                else {
+                    "tools": [
+                        example_entry(validate_schema(self.resolve_tool(n)))
+                        for n in sorted(w["chosen"])
+                    ]
+                }
+            )
+            scope.update({"until_ended": True} if seconds == 0 else {"duration_seconds": seconds})
+            self.wizard = None
+            # The same trusted preparation and the same complete review as a request in words:
+            # for someone who already has access this is a change to it, not a second grant.
+            share_id = self.existing_access(who, w["person"])
+            await self.proposal_card(service.prepare(who, w["person"], scope, share_id=share_id))
+        else:
+            raise GuestsError(
+                "That choice is not available. Send /guests_new and their name to start again."
+            )
+
+    def owner_tools(self, *, require_management=True):
+        descriptions = {}
+        for spec in self.installed_tools():
+            function = spec.get("function", spec)
+            descriptions[function["name"]] = function.get("description", function["name"])
+        from .compat import native_definitions
+
+        for spec in native_definitions(collapsed=True):
+            f = spec.get("function", spec)
+            if f.get("name") in {"tool_search", "tool_describe"}:
+                descriptions[f["name"]] = f.get("description", f["name"])
+        if require_management and not MANAGEMENT_TOOLS <= set(descriptions):
+            raise GuestsError(
+                "Sharing tools are disabled for Telegram. Enable Hermes Guests in Hermes's tool settings, then send /guests_setup."
+            )
+        return descriptions
+
+    async def send(self, chat, text, buttons=None):
+        if self.app is None:
+            raise GuestsError(
+                "Telegram isn't connected. Your access proposal has not been activated."
+            )
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+        markup = None
+        if buttons:
+            markup = InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton(label, callback_data=data) for label, data in row]
+                    for row in buttons
+                ]
+            )
+
+        async def deliver():
+            from telegram.error import RetryAfter
+
+            from .ui import heading_entities, pages
+
+            chunks = pages(text, limit=3360)
+            result = None
+            lock = self._send_locks.setdefault(str(chat), asyncio.Lock())
+            async with lock:
+                for i, chunk in enumerate(chunks):
+                    if len(chunks) > 1:
+                        chunk = f"({i + 1}/{len(chunks)})\n" + chunk
+                    # Buttons appear only after the complete, ordered review is delivered.
+                    for attempt in range(3):
+                        try:
+                            result = await self.app.bot.send_message(
+                                chat_id=int(chat),
+                                text=chunk,
+                                entities=heading_entities(chunk, first_page=i == 0),
+                                reply_markup=markup if i == len(chunks) - 1 else None,
+                            )
+                            break
+                        except RetryAfter as exc:
+                            delay = (
+                                exc.retry_after.total_seconds()
+                                if hasattr(exc.retry_after, "total_seconds")
+                                else float(exc.retry_after)
+                            )
+                            if attempt == 2 or delay > 30:
+                                raise
+                            await asyncio.sleep(delay + 0.1)
+            return result
+
+        if self.loop is asyncio.get_running_loop():
+            return await deliver()
+        future = asyncio.run_coroutine_threadsafe(deliver(), self.loop)
+        return await asyncio.wrap_future(future)
+
+    async def ask_for_more_time(self, who, share_id, sent):
+        service = self.ensure()
+        review = service.renewal(who, share_id)
+        try:
+            await self.proposal_card(review)
+        except Exception:
+            # As with a request for more access: a request the owner never saw is taken
+            # back, so it neither waits unanswered nor uses up the guest's few a day.
+            service.withdraw_renewal(share_id, review["proposal_id"])
+            raise GuestsError(
+                "I could not reach the owner just now, so nothing was sent. Try again in a moment."
+            ) from None
+        await self.send(who, sent)
+
+    async def proposal_card(self, proposal, *, force_details=False, also=False):
+        saved = self.ensure().ledger.snapshot()["proposals"].get(proposal["proposal_id"], {})
+        # Saved with the review, so a card restored later still says what was removed.
+        left_out = saved.get("left_out") or proposal.get("left_out") or []
+        kept = None
+        if saved.get("scope") and saved.get("action") not in {"revoke", "delete", "retention"}:
+            seconds = self.ensure().data_settings(self.ensure().owner_id)["retention_seconds"]
+            kept = (
+                "Their conversations and memories are "
+                + kept_text(seconds)
+                + ". Change this for all guests in /guests_setup."
+            )
+        detailed = force_details or self.ctx.state.get("detailed_access_cards", False)
+        text = proposal["text"]
+        if kept and not detailed:
+            summary = simple_access(saved["scope"], self.ensure().catalog, self.ensure().zone)
+            text = "At a glance\n" + summary + "\n\n" + text
+        message = await self.send(
+            self.ensure().owner_id,
+            text
+            + ("\n\n" + kept if kept else "")
+            + (
+                "\n\nLeft out because of your never-share list:\n"
+                + "\n".join("• " + line for line in left_out[:20])
+                if left_out
+                else ""
+            )
+            + "\n\nApprove by "
+            + deadline(
+                self.ensure().ledger.snapshot()["proposals"][proposal["proposal_id"]][
+                    "valid_until"
+                ],
+                self.ensure().zone,
+            ),
+            [
+                [
+                    (
+                        "Delete data" if saved.get("action") == "delete" else "Approve",
+                        "hs:p:" + proposal["proposal_id"],
+                    ),
+                ],
+                [
+                    ("Change", "hs:c:" + proposal["proposal_id"]),
+                    ("Cancel", "hs:d:" + proposal["proposal_id"]),
+                ],
+            ]
+            + (
+                []
+                if saved.get("action") in {"revoke", "delete", "retention"}
+                or not saved.get("scope")
+                else [
+                    [
+                        (
+                            "Preview as " + clip(saved.get("label", "guest"), 24),
+                            "hs:g:" + proposal["proposal_id"],
+                        ),
+                        ("Details", "hs:Q:" + proposal["proposal_id"]),
+                    ]
+                ]
+            ),
+        )
+
+        self.ensure().present_review(
+            self.ensure().owner_id,
+            "proposal",
+            proposal["proposal_id"],
+            message.message_id,
+            message.chat.id,
+            also=also,
+        )
+
+    async def claim_card(self, claim_id, guest_id, label, text):
+        service = self.ensure()
+        db = service.ledger.snapshot()
+        claim = db["invites"][claim_id]
+        proposal = db["proposals"][claim["proposal_id"]]
+        if not self.ctx.state.get("detailed_access_cards", False):
+            summary = simple_access(proposal["scope"], service.catalog, service.zone)
+            text = summary + "\n\n" + text
+        key = claim_id[:24]
+        message = await self.send(
+            service.owner_id,
+            "Guest account awaiting approval\n\n"
+            + label
+            + " · ID "
+            + guest_id
+            + "\n\n"
+            + text
+            + "\n\nConfirm by "
+            + deadline(claim["claim_until"], service.zone),
+            [
+                [("Accept guest", "hs:a:" + key), ("Deny", "hs:n:" + key)],
+                [("Details", "hs:W:" + key)],
+            ],
+        )
+        service.present_review(service.owner_id, "claim", key, message.message_id, message.chat.id)
+
+    async def tool(self, name, args):
+        try:
+            who = actor()
+            service = self.ensure()
+            service.owner(who)
+            if name in {"guests_discover", "guests_prepare_access"} and not service.owner_ready():
+                await self.setup_review(who)
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": "A setup review is in this chat. Enable sharing, then repeat your request.",
+                    }
+                )
+            metadata = {}
+            if name == "guests_discover":
+                result = self.discover(
+                    who, query=args.get("query", ""), cursor=args.get("cursor", 0)
+                )
+            elif name == "guests_data":
+                action = args.get("action", "inspect")
+                if action == "inspect":
+                    result = service.data_settings(who)
+                    await self.data_card(who)
+                else:
+                    if action == "retention":
+                        p = service.prepare(
+                            who,
+                            "Guest data",
+                            None,
+                            action="retention",
+                            retention_seconds=args.get("retention_seconds"),
+                        )
+                    elif action == "delete":
+                        sid = args.get("share_id") or self.existing_access(
+                            who, args.get("person"), ended=True
+                        )
+                        p = service.prepare(
+                            who, args.get("person", "Guest"), None, share_id=sid, action="delete"
+                        )
+                    else:
+                        raise GuestsError("Choose inspect, retention or delete for guest data.")
+                    await self.proposal_card(p)
+                    result = {
+                        "status": "awaiting_owner_confirmation",
+                        "review": p["text"],
+                        "tell_the_owner": "Confirm using the review buttons sent in this chat.",
+                    }
+            elif name == "guests_prepare_access":
+                if args.get("action") not in {"revoke", "delete"}:
+                    from .intake import tidy
+
+                    args = tidy(args, self.resolve_tool)
+                    if args.get("scope", {}).get("lights"):
+                        self.discover(who, query="light")
+                        self.verify_lights(who, args["scope"]["lights"])
+                    if args.get("scope", {}).get("research") and not all(
+                        self.resolve_tool(n) for n in ("web_search", "web_extract")
+                    ):
+                        raise GuestsError("Web search and page reading aren't both connected yet.")
+                share_id = args.get("share_id") or self.existing_access(
+                    who, args.get("person"), ended=args.get("action") == "delete"
+                )
+                if share_id and args.get("action") not in {"revoke", "delete"}:
+                    args["scope"] = self.keep_current(who, share_id, args.get("scope"))
+                p = service.prepare(
+                    who,
+                    args.get("person", "Guest"),
+                    args.get("scope"),
+                    share_id=share_id,
+                    action=args.get("action", "replace"),
+                    invitation_seconds=args.get("invitation_seconds"),
+                )
+                await self.proposal_card(p)
+                # The model relays this. Without it, models invent a review link or tell the
+                # owner to confirm somewhere else.
+                result = {
+                    "status": "awaiting_owner_confirmation",
+                    "left_out_by_the_owners_never_share_list": p.get("left_out", []),
+                    "review": p["text"],
+                    "tell_the_owner": "The review was just sent in this chat as a message with Approve, Change and Cancel buttons. Nothing changes until they press Approve. Do not give a link, an ID or another place to confirm; there is none.",
+                }
+            elif name == "guests_list_access":
+                result = [
+                    {
+                        "share_id": r["id"],
+                        "person": r["label"],
+                        "status": r["effective_status"],
+                        "scope": r["scope"],
+                    }
+                    for r in service.list_access(who)
+                ]
+            elif name == "guests_status":
+                db = service.ledger.snapshot()
+                invitations = []
+                for invitation in db["invites"].values():
+                    status = invitation["status"]
+                    expiry = (
+                        invitation.get("claim_until", invitation["expires_at"])
+                        if status == "claimed"
+                        else invitation["expires_at"]
+                    )
+                    if status in {"open", "claimed"} and expiry <= service.clock():
+                        status = "expired"
+                    invitations.append(
+                        {
+                            "person": db["proposals"][invitation["proposal_id"]]["label"],
+                            "status": status,
+                            "invitation_deadline": iso(invitation["expires_at"]),
+                            "confirmation_deadline": iso(invitation["claim_until"])
+                            if "claim_until" in invitation
+                            else None,
+                        }
+                    )
+                result = {
+                    "reviews": [
+                        {
+                            "proposal_id": p["id"],
+                            "person": p["label"],
+                            "status": "pending"
+                            if p["valid_until"] > service.clock()
+                            else "expired",
+                            "approval_deadline": iso(p["valid_until"]),
+                            "invitation_seconds": p.get("invitation_seconds"),
+                        }
+                        for p in db["proposals"].values()
+                        if p["status"] == "pending"
+                    ],
+                    "invitations": invitations,
+                }
+            elif name == "guests_activity":
+                from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+                selected = args.get("scope")
+                if selected is None:
+                    person = str(args.get("person", "")).strip().casefold()
+                    if person in {"me", "myself", "owner"} or args.get("share_id") == "owner":
+                        selected = "owner"
+                    else:
+                        selected = "guest" if person or args.get("share_id") else "all"
+                zone = args.get("timezone") or service.zone
+                try:
+                    ZoneInfo(zone)
+                except (ZoneInfoNotFoundError, ValueError, TypeError) as exc:
+                    raise GuestsError("Choose a timezone such as America/Toronto or EST.") from exc
+                share_id = None
+                if selected == "guest":
+                    share_id = args.get("share_id") or self.existing_access(
+                        who, args.get("person"), ended=True
+                    )
+                    if not share_id:
+                        raise GuestsError("Choose a guest, owner activity or everyone's activity.")
+                limit = args.get("limit", 50)
+                result, count = await self.activity_card(who, selected, share_id, zone, limit)
+                metadata = {
+                    "timezone": zone,
+                    "already_displayed": True,
+                    "coverage": "recent retained tool requests, decisions and sharing changes",
+                    "limit": limit,
+                    "records_returned": count,
+                    "tell_the_owner": "The timestamped activity card was sent in this chat. Keep any follow-up brief. Preserve local_time and timezone when discussing an event. Owner inputs are omitted and authorization alone does not establish completion.",
+                }
+            elif name == "guests_never":
+                change = self.never_change(args)
+                await self.never_confirm_card(who, change)
+                result = {
+                    "status": "awaiting_owner_confirmation",
+                    "change": change["text"],
+                    "tell_the_owner": "A card with Confirm and Cancel buttons was just sent in this chat. The never-share list changes only when they press Confirm.",
+                }
+            elif name == "guests_repair":
+                result = service.repair(who)
+                self.discover(who)
+            else:
+                raise GuestsError("Unknown sharing action.")
+            return json.dumps({"ok": True, "result": result, **metadata})
+        except GuestsError as exc:
+            return json.dumps({"ok": False, "error": str(exc)})
+
+    def owner_boundary(self, tool_name="", args=None, session_id="", **_kw):
+        from gateway.session_context import get_session_env
+
+        if get_session_env("HERMES_SESSION_PLATFORM", "") != "telegram":
+            return None
+        configured = self.configured_before()
+        strict = self.ctx.get_config("require_owner_warrant", False) is True
+        if not configured and not strict:
+            return None
+        who = str(get_session_env("HERMES_SESSION_USER_ID", "") or "")
+        try:
+            owner = owner_identity(self.ctx)
+        except GuestsError:
+            owner = None
+        if not who or who != owner:
+            if not configured:
+                return None
+            return {
+                "action": "block",
+                "message": "Guest tool execution must use its isolated Hermes Guests profile.",
+            }
+        try:
+            service = self.ensure()
+            decision = service.check_owner(who, tool_name, args or {}, session_id, enforce=strict)
+            if strict:
+                return decision
+            if decision is not None:
+                service.audit.event(
+                    "owner_tool_requested", share_id="owner", actor=who, tool=tool_name
+                )
+        except Exception:
+            if strict:
+                return {
+                    "action": "block",
+                    "message": "Your owner warrant is unavailable. Send /guests_setup to review it.",
+                }
+            logging.getLogger(__name__).debug("Could not check the owner warrant")
+        return None
+
+    def owner_turn_context(self, platform="", **_kw):
+        if platform != "telegram":
+            return None
+        try:
+            who = actor()
+            if who != owner_identity(self.ctx):
+                return None
+        except GuestsError:
+            return None
+        return {
+            "context": (
+                "For guest access requests, use the Hermes Guests tools. Discover the service "
+                "with guests_discover, then use guests_prepare_access to create a review. "
+                "If the tools are deferred, find them with tool_search. Use guests_list_access "
+                "to inspect current grants. If sharing isn't set up and the tools are unavailable, "
+                "ask the owner to send /guests_setup, then repeat their request. "
+                "Only the owner can approve a review in Telegram."
+            )
+        }
+
+    async def report_problem(self, who, exc):
+        logging.getLogger(__name__).warning(
+            "Sharing action could not complete (%s)", type(exc).__name__
+        )
+        if self.service:
+            self.service.audit.event("runtime_unavailable", actor=who, reason=type(exc).__name__)
+        try:
+            owner = self.service.owner_id if self.service else owner_identity(self.ctx)
+            text = (
+                "Sharing couldn't finish that request. Changes you already confirmed may have applied; check /guests. Use Check sharing there to verify saved access, or /guests_recover if a sharing key was lost."
+                if str(who) == owner
+                else "I couldn't complete that request. Use /access to check your current access, then try again. If it continues, ask the owner to check sharing."
+            )
+            await self.send(who, text)
+        except Exception:
+            logging.getLogger(__name__).warning("Sharing status could not be delivered.")
+
+    async def callback(self, update, context):
+        from telegram.ext import ApplicationHandlerStop
+
+        with own_profile():
+            try:
+                return await self._callback(update, context)
+            except ApplicationHandlerStop:
+                raise
+            except Exception as exc:
+                try:
+                    await self.report_problem(str(update.effective_user.id), exc)
+                finally:
+                    raise ApplicationHandlerStop
+
+    async def _callback(self, update, context):
+        from telegram.ext import ApplicationHandlerStop
+
+        q = update.callback_query
+        if q is None or not (q.data or "").startswith("hs:"):
+            return
+        await q.answer()
+        if (
+            q.message is None
+            or q.message.chat.type != "private"
+            or q.message.chat.id != q.from_user.id
+        ):
+            raise ApplicationHandlerStop
+        who = str(q.from_user.id)
+        try:
+            action, identifier = q.data.split(":", 2)[1:]
+            if action == "x":
+                owner = owner_identity(self.ctx)
+                if (
+                    who != owner
+                    or not self.pending_recovery
+                    or identifier != self.pending_recovery["token"]
+                    or self.pending_recovery["expires"] <= time.time()
+                    or self.pending_recovery.get("message_id") != q.message.message_id
+                ):
+                    raise GuestsError(
+                        "Recovery review expired. Send /guests_recover to review again."
+                    )
+                from .recovery import recover_local_authority
+
+                recover_local_authority(self.ctx.state, owner)
+                if self.runner and hasattr(self.runner, "close"):
+                    self.runner.close()
+                for task in list(self._guest_tasks.values()):
+                    task.cancel()
+                if self.broker:
+                    self.broker.close()
+                self.service = None
+                self.runner = None
+                self.broker = None
+                self.pending_recovery = None
+                await self.send(
+                    who,
+                    "Old local guest access has ended. Send /guests_setup to finish setup with the new identity, then create fresh invitations.",
+                )
+                raise ApplicationHandlerStop
+            service = self.ensure()
+            if action == "h":
+                service.owner(who)
+                if identifier == "setup":
+                    await self.setup_review(who)
+                elif identifier == "status":
+                    await self.status(who)
+                elif identifier == "add":
+                    if not service.owner_ready():
+                        raise GuestsError("First enable sharing with /guests_setup.")
+                    self._never_word = None
+                    self._name_prompt = {"until": time.time() + 600}
+                    await self.send(
+                        who,
+                        "Who is it for? Send their name as your next message. Send /cancel to skip.",
+                    )
+                elif identifier == "activity":
+                    await self.activity_card(who, "all")
+                elif identifier == "check":
+                    result = await asyncio.to_thread(service.repair, who)
+                    removed = await asyncio.to_thread(service.maintenance, who)
+                    await self.send(
+                        who,
+                        f"Sharing checked: {len(result['restored'])} active grants verified; {len(result['paused'])} need a new review; {len(removed)} ended profiles cleaned up. No permissions or expiry were expanded.",
+                    )
+                elif identifier == "invite":
+                    await self.send(
+                        who,
+                        "Who should use your assistant, what should they be able to do, and for how long? For conversation only, say ‘chat only’.",
+                    )
+                    if not service.owner_ready():
+                        await self.send(
+                            who,
+                            "First enable sharing with /guests_setup. Then tell me what to share.",
+                        )
+                raise ApplicationHandlerStop
+            if action == "q":
+                record = service.guest(who)
+                if record["id"] != identifier or not service._fresh(record):
+                    raise GuestsError("This button is no longer available.")
+                self._asking[who] = time.time() + 600
+                await self.send(
+                    who,
+                    "What would you like to be able to do? Send it as your next message, in a sentence. "
+                    "The owner sees your words and decides. Send /cancel to skip.",
+                )
+                raise ApplicationHandlerStop
+            if action == "J":
+                record = service.guest(who)
+                if record["id"] != identifier:
+                    raise GuestsError("This button is no longer available.")
+                await self.send(
+                    who, review(record["label"], record["scope"], service.catalog, service.zone)
+                )
+                raise ApplicationHandlerStop
+            if action == "r":
+                await self.ask_for_more_time(
+                    who,
+                    identifier,
+                    "Your renewal request is with the owner. Access stays unchanged until approved.",
+                )
+            else:
+                service.owner(who)
+                if action == "F":
+                    if identifier not in {"simple", "detailed"}:
+                        raise GuestsError("Choose Simple or Detailed.")
+                    self.ctx.state.set("detailed_access_cards", identifier == "detailed")
+                    await self.send(who, f"Access cards will use the {identifier} view.")
+                elif action in {"Q", "V"}:
+                    service.check_review(
+                        who,
+                        "proposal" if action == "Q" else "preview",
+                        identifier,
+                        q.message.message_id,
+                        q.message.chat.id,
+                    )
+                    saved = service.ledger.snapshot()["proposals"][identifier]
+                    await self.proposal_card(
+                        {"proposal_id": identifier, "text": service.proposal_review(saved)},
+                        force_details=True,
+                        also=True,
+                    )
+                elif action == "D":
+                    await self.data_card(who)
+                elif action == "N":
+                    await self.never_card(who)
+                elif action == "K":
+                    await self.never_confirmed(who, identifier, q.message.message_id)
+                elif action == "R":
+                    if identifier not in {"forever", "0", "86400", "604800", "2592000"}:
+                        raise GuestsError("Open Guest data to choose a retention period.")
+                    await self.proposal_card(
+                        service.prepare(
+                            who,
+                            "Guest data",
+                            None,
+                            action="retention",
+                            retention_seconds=None if identifier == "forever" else int(identifier),
+                        )
+                    )
+                elif action == "X":
+                    await self.extend_choices(who, service.get_access(who, identifier))
+                elif action == "Y":
+                    await self.extend(who, identifier)
+                elif action in {"v", "t", "e", "l", "z"}:
+                    record = service.get_access(who, identifier)
+                    if action == "v":
+                        await self.send(
+                            who,
+                            review(record["label"], record["scope"], service.catalog, service.zone)
+                            + "\n\n"
+                            + (
+                                self.runner.data_status(record)
+                                if hasattr(self.runner, "data_status")
+                                else "How long guest data is kept is set in /guests_setup."
+                            ),
+                            [
+                                [
+                                    ("Change what they can use", "hs:u:" + identifier),
+                                    *(
+                                        []
+                                        if record["scope"].get("until_ended")
+                                        or record.get("data_deletion_requested_at") is not None
+                                        else [("Extend", "hs:X:" + identifier)]
+                                    ),
+                                ],
+                                [("Activity", "hs:l:" + identifier)],
+                                [
+                                    ("End access", "hs:e:" + identifier),
+                                    ("End and delete data", "hs:z:" + identifier),
+                                ],
+                            ],
+                        )
+                    elif action == "t":
+                        await self.send(
+                            who,
+                            "Tell me what to change for "
+                            + record["label"]
+                            + ". I will prepare a new review before applying it.",
+                        )
+                    elif action == "z":
+                        await self.proposal_card(
+                            service.prepare(
+                                who, record["label"], None, share_id=identifier, action="delete"
+                            )
+                        )
+                    elif action == "e":
+                        await self.proposal_card(
+                            service.prepare(
+                                who, record["label"], None, share_id=identifier, action="revoke"
+                            )
+                        )
+                    else:
+                        await self.send(
+                            who,
+                            activity_text(
+                                record["label"], service.activity(who, identifier), service.zone
+                            )
+                            + "\n\nChat refusals are separate from tool decisions. An allowed call may still fail at the service.",
+                        )
+                elif action == "s":
+                    if (
+                        not self.pending_setup
+                        or identifier != self.pending_setup["token"]
+                        or self.pending_setup["expires"] <= time.time()
+                        or self.pending_setup.get("message_id") != q.message.message_id
+                    ):
+                        raise GuestsError(
+                            "Setup review expired. Send /guests_setup to review again."
+                        )
+                    reviewed = self.pending_setup.get("carried_scope")
+                    if reviewed:
+                        try:  # before anything is committed: the tools are as they were reviewed
+                            service.normalize_scope(reviewed, saved=True)
+                        except GuestsError as changed:
+                            self.pending_setup = None
+                            raise GuestsError(
+                                "A tool changed since this setup review. Send /guests_setup to review again."
+                            ) from changed
+                    if self.pending_setup["missing_management"]:
+                        from .compat import enable_telegram_management_tools
+
+                        enable_telegram_management_tools()
+                    current = self.owner_tools()
+                    reviewed_tools = self.pending_setup["tools"]
+                    new_tools = current.keys() - reviewed_tools.keys()
+                    if new_tools - MANAGEMENT_TOOLS - {"tool_search", "tool_describe"} or (
+                        reviewed_tools.keys() - current.keys()
+                    ):
+                        self.pending_setup = None
+                        raise GuestsError(
+                            "Your tools changed while setup was open. Send /guests_setup to review them again."
+                        )
+                    service.setup_owner(who, current)
+                    taken = []
+                    for person in self.pending_setup.get("others", []) if reviewed else []:
+                        adopted = service.adopt(who, person["id"], person["label"], scope=reviewed)
+                        if adopted.get("status") == "active":
+                            taken.append(person["label"])
+                    self.pending_setup = None
+                    await self.setup_sections(
+                        who,
+                        "Sharing is ready. Tell me who should use which services and for how long, or send /guests_new and their name to choose with buttons."
+                        + (
+                            "\n\nNow limited to their own access: "
+                            + ", ".join(taken)
+                            + ". Send /guests to see or change it."
+                            if taken
+                            else ""
+                        )
+                        + "\n\nBefore you invite anyone, you can also list what guests may never use, and choose how long their data is kept after access ends. Both stay in /guests_setup.",
+                    )
+                elif action == "w":
+                    await self.wizard_press(who, identifier)
+                elif action == "k":
+                    await self.never_press(who, identifier)
+                elif action == "g":
+                    service.check_review(
+                        who, "proposal", identifier, q.message.message_id, q.message.chat.id
+                    )
+                    saved = service.ledger.snapshot()["proposals"].get(identifier, {})
+                    if saved.get("status") != "pending" or not saved.get("scope"):
+                        raise GuestsError("This review is no longer open.")
+                    shown = await self.send(
+                        who,
+                        service.returns_notice(saved) + "Preview only. Nothing has been sent.\n"
+                        "This is the first message "
+                        + saved["label"]
+                        + " would get:\n\n"
+                        + guest_view(
+                            saved["label"],
+                            saved["scope"],
+                            service.catalog,
+                            service.zone,
+                            inviter=q.from_user.full_name[:80],
+                            detailed=self.ctx.state.get("detailed_access_cards", False),
+                        )
+                        + (
+                            "\n\n" + service.invitation_window_text(saved["invitation_seconds"])
+                            if "invitation_seconds" in saved
+                            else ""
+                        ),
+                        [
+                            [
+                                ("Back to review", "hs:V:" + identifier),
+                            ]
+                        ],
+                    )
+                    # The preview can open the full review; it cannot issue authority.
+                    service.present_review(
+                        who, "preview", identifier, shown.message_id, shown.chat.id, also=True
+                    )
+                elif action == "u":
+                    await self.change_start(who, service.get_access(who, identifier))
+                elif action == "o":
+                    sid, _, token = identifier.partition(":")
+                    await self.change_start(who, service.answer_more_request(who, sid, token))
+                elif action == "j":
+                    sid, _, token = identifier.partition(":")
+                    record = service.answer_more_request(who, sid, token)
+                    await self.send(who, record["label"] + "'s access stays as it is.")
+                    await self.send(
+                        record["guest_id"],
+                        "The owner did not change your access this time. /access shows what you have.",
+                    )
+                elif action in {"p", "d", "c"}:
+                    service.check_review(
+                        who, "proposal", identifier, q.message.message_id, q.message.chat.id
+                    )
+                    if action in {"d", "c"}:
+                        service.deny(who, identifier)
+                        await self.send(
+                            who,
+                            "Not applied. Tell me what to change."
+                            if action == "c"
+                            else "Access was not changed.",
+                        )
+                    else:
+                        result = service.approve(who, identifier)
+                        if result["status"] == "invited":
+                            if "token" not in result:
+                                result = service.refresh_invitation(who, identifier)
+                            if "token" not in result:
+                                await self.send(
+                                    who,
+                                    "This invitation was already created. Ask me to prepare another if you lost its link.",
+                                )
+                            else:
+                                me = await self.app.bot.get_me()
+                                await self.send(
+                                    who,
+                                    "Send this invitation to your guest. It expires "
+                                    + deadline(result["expires_at"], service.zone)
+                                    + ". You'll confirm their account before access starts.\nhttps://t.me/"
+                                    + me.username
+                                    + "?start=guests_"
+                                    + result["token"],
+                                )
+                        elif result["status"] == "retention_updated":
+                            await self.send(
+                                who,
+                                "Guest data retention updated. "
+                                + (
+                                    "Keep until you delete it."
+                                    if result["retention_seconds"] is None
+                                    else service.retention_text(result["retention_seconds"])
+                                    + " after access ends. Shortened retention applies to existing ended profiles too."
+                                ),
+                            )
+                            await asyncio.to_thread(service.maintenance, who)
+                        elif result["status"] == "deletion_requested":
+                            try:
+                                await asyncio.to_thread(service.maintenance, who)
+                            except Exception as exc:
+                                logging.getLogger(__name__).warning(
+                                    "Guest data deletion remains pending (%s)", type(exc).__name__
+                                )
+                            records = [service.get_access(who, sid) for sid in result["shares"]]
+                            complete = all(r.get("profile_deleted_at") is not None for r in records)
+                            await self.send(
+                                who,
+                                "Access ended. "
+                                + (
+                                    "Guest conversations, memories and profiles deleted."
+                                    if complete
+                                    else "Guest data deletion is pending. Check Guest data after workers stop."
+                                )
+                                + " Security and audit records are retained. Already-admitted service actions may still finish.",
+                            )
+                            await self.send(
+                                result["guest_id"],
+                                "The owner ended your access and requested deletion of your conversations and private memories.",
+                            )
+                        elif result["status"] == "active":
+                            await asyncio.to_thread(self.runner.ensure_profile, result["share_id"])
+                            await self.send(who, result["text"] + "\n\nAccess updated.")
+                            await self.send(
+                                result["guest_id"], "Your access was updated.\n" + result["text"]
+                            )
+                        else:
+                            await self.send(
+                                who,
+                                "Access ended. New chats and tool actions are blocked. Guest data follows your retention setting. Actions already in progress may still finish.",
+                            )
+                            record = service.get_access(who, result["share_id"])
+                            await self.send(
+                                record["guest_id"],
+                                "The owner ended your access. Ask them to authorize you again before chatting or using services. Actions already in progress may still finish.",
+                            )
+                elif action == "i":
+                    result = service.refresh_invitation(who, identifier)
+                    me = await self.app.bot.get_me()
+                    await self.send(
+                        who,
+                        "Send this replacement invitation. It expires "
+                        + deadline(result["expires_at"], service.zone)
+                        + ". The previous link has ended.\nhttps://t.me/"
+                        + me.username
+                        + "?start=guests_"
+                        + result["token"],
+                    )
+                elif action == "W":
+                    service.check_review(
+                        who, "claim", identifier, q.message.message_id, q.message.chat.id
+                    )
+                    db = service.ledger.snapshot()
+                    claim = next(
+                        i for key, i in db["invites"].items() if key.startswith(identifier)
+                    )
+                    await self.send(
+                        who, service.proposal_review(db["proposals"][claim["proposal_id"]])
+                    )
+                elif action in {"a", "n"}:
+                    service.check_review(
+                        who, "claim", identifier, q.message.message_id, q.message.chat.id
+                    )
+                    result = service.accept_claim(who, identifier, accept=action == "a")
+                    if result["status"] == "active":
+                        await asyncio.to_thread(self.runner.ensure_profile, result["share_id"])
+                        await self.guest_menu(result["guest_id"])
+                        await self.send(who, "Guest access is ready.")
+                        welcomed = service.get_access(who, result["share_id"])
+                        await self.send(
+                            result["guest_id"],
+                            guest_view(
+                                welcomed["label"],
+                                welcomed["scope"],
+                                service.catalog,
+                                service.zone,
+                                inviter=q.from_user.full_name[:80],
+                                detailed=self.ctx.state.get("detailed_access_cards", False),
+                            ),
+                            [[("See permissions", "hs:J:" + result["share_id"])]],
+                        )
+                    else:
+                        await self.send(who, "The invitation was declined.")
+                        if result.get("guest_id"):
+                            await self.send(
+                                result["guest_id"],
+                                "The owner declined this invitation. No service access was granted.",
+                            )
+                else:
+                    raise GuestsError("This button is no longer available.")
+            if action not in {
+                "g",
+                "Q",
+                "V",
+                "W",
+                "v",
+                "l",
+                "t",
+            }:  # looking at something leaves the card usable
+                try:
+                    await q.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+        except GuestsError as exc:
+            await self.send(who, str(exc))
+        raise ApplicationHandlerStop
+
+    async def message(self, update, context):
+        from telegram.ext import ApplicationHandlerStop
+
+        with own_profile():
+            try:
+                return await self._message(update, context)
+            except ApplicationHandlerStop:
+                raise
+            except Exception as exc:
+                try:
+                    await self.report_problem(str(update.effective_user.id), exc)
+                finally:
+                    raise ApplicationHandlerStop
+
+    async def _message(self, update, context):
+        from telegram.ext import ApplicationHandlerStop
+
+        message = update.effective_message
+        user = update.effective_user
+        if not message or not user or message.chat.type != "private" or user.is_bot:
+            return
+        who = str(user.id)
+        try:
+            text = message.text or ""
+            if text.strip() == "/guests_recover":
+                owner = owner_identity(self.ctx)
+                if who != owner:
+                    raise GuestsError("Only the owner can recover sharing.")
+                self.pending_recovery = {
+                    "token": secrets.token_urlsafe(12),
+                    "expires": time.time() + self.ensure().review_seconds,
+                }
+                message_sent = await self.send(
+                    who,
+                    "Reset the local sharing identity?\n\nAll current guest access and invitations will end. Saved conversations and audit evidence will be retained until their normal cleanup. You'll complete setup and send new invitations. Use this only if saved keys cannot be restored. Any external authorizers must separately stop trusting the old identity.",
+                    [[("End access and reset", "hs:x:" + self.pending_recovery["token"])]],
+                )
+                self.pending_recovery["message_id"] = message_sent.message_id
+                raise ApplicationHandlerStop
+            if await self.never_word_answer(who, text):
+                raise ApplicationHandlerStop
+            if await self.name_answer(who, text):
+                raise ApplicationHandlerStop
+            configured = self.configured_before()
+            try:
+                owner = owner_identity(self.ctx)
+            except GuestsError:
+                owner = None
+            if not configured and text.strip() != "/guests_setup":
+                if who == owner:
+                    command = text.split()[:1]
+                    if command in (["/guests"], ["/guests_new"]) or FIRST_SHARE_REQUEST.match(
+                        text.strip()
+                    ):
+                        await self.setup_review(who)
+                        raise ApplicationHandlerStop
+                    if self.ctx.state.get("onboarding_prompted_owner", None) != who:
+                        try:
+                            await self.send(
+                                who,
+                                "Set up guest sharing whenever you're ready to invite someone.",
+                                [[("Set up guest sharing", "hs:h:setup")]],
+                            )
+                            self.ctx.state.set("onboarding_prompted_owner", who)
+                        except Exception:
+                            logging.getLogger(__name__).warning(
+                                "Guest setup prompt could not be saved or delivered"
+                            )
+                return
+            if who == owner:
+                if text.startswith("/start guests_"):
+                    await self.send(
+                        who,
+                        "This invitation is for your guest. Forward its link to them; you'll confirm their account when they open it.",
+                    )
+                    raise ApplicationHandlerStop
+                if text.strip().casefold() in {
+                    "/guests",
+                    "who has access?",
+                    "who has access",
+                    "manage access",
+                }:
+                    await self.status(who)
+                    raise ApplicationHandlerStop
+                if text.strip() == "/cancel" and getattr(self, "_never_word", None):
+                    self._never_word = None
+                    await self.send(who, "Nothing was added.")
+                    raise ApplicationHandlerStop
+                if text.strip() == "/cancel" and getattr(self, "_name_prompt", None):
+                    self._name_prompt = None
+                    await self.send(who, "No guest was added.")
+                    raise ApplicationHandlerStop
+                if text.split()[:1] == ["/guests_new"]:
+                    if self.ensure().owner_ready():
+                        await self.wizard_start(
+                            who,
+                            text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else "",
+                        )
+                    else:
+                        await self.setup_review(who)
+                    raise ApplicationHandlerStop
+                if text.strip() == "/guests_setup":
+                    await self.setup_review(who)
+                    raise ApplicationHandlerStop
+                return  # Normal native owner agent handles conversational management tools.
+            if text.strip() == "/guests_setup":
+                owner = owner_identity(self.ctx)
+                if who != owner:
+                    raise GuestsError("Only the owner can set up sharing.")
+            service = self.ensure()
+            if not message.text:
+                await self.send(
+                    who,
+                    "Send a text message to use your shared services. Photos, files, and voice messages aren't supported in guest chat yet.",
+                )
+                raise ApplicationHandlerStop
+            if text.startswith("/start guests_"):
+                token = text.split("guests_", 1)[1].strip()
+                claim = service.claim(token, who, user.full_name, username=user.username or "")
+                await self.send(
+                    who,
+                    "Your request is waiting for the owner's approval. No service access is active yet.",
+                )
+                await self.claim_card(
+                    claim["claim_id"],
+                    who,
+                    user.full_name + " · @" + (user.username or "(no username)"),
+                    claim["text"],
+                )
+            else:
+                record = service.guest(who)
+                # Said in words instead of with the button: the same request, with the same
+                # record and the same limits. Without current access the renewal path answers.
+                worded = text.casefold().startswith("request access to ") and service._fresh(record)
+                asked_at = self._asking.get(who, 0)
+                if asked_at and time.time() >= asked_at + 3600:
+                    self._asking.pop(who, None)  # long past: an ordinary message again
+                if (
+                    not worded
+                    and not text.startswith("/")
+                    and asked_at
+                    and asked_at <= time.time() < asked_at + 3600
+                ):
+                    # They were asked for a request and answered late. It goes nowhere, and
+                    # they are told, so it is not quietly read as a message to the assistant.
+                    self._asking.pop(who, None)
+                    await self.send(
+                        who,
+                        "That request timed out, so this message was not sent to the owner or "
+                        "to the assistant. Press Request more access again, or just send your "
+                        "message again to carry on.",
+                    )
+                    raise ApplicationHandlerStop
+                if worded or (self._asking.get(who, 0) > time.time() and not text.startswith("/")):
+                    # Their words go to the owner as written, never to a model.
+                    words = plain_words(text)
+                    if not words:
+                        # Nothing readable. The prompt stays open, so the next try is
+                        # taken as the request too and not as a message to the assistant.
+                        raise GuestsError(
+                            "Send what you would like as a short text message, or /cancel."
+                        )
+                    self._asking.pop(who, None)
+                    asked = service.note_more_request(who, record["id"], words)
+                    try:
+                        await self.more_card(asked["label"], record["id"], asked["token"], words)
+                    except Exception:
+                        service.withdraw_more_request(record["id"], asked["token"])
+                        raise GuestsError(
+                            "I could not reach the owner just now, so nothing was sent. Try again in a moment."
+                        ) from None
+                    await self.send(
+                        who,
+                        "Sent to the owner. Your access stays the same unless they approve a change.",
+                    )
+                    raise ApplicationHandlerStop
+                if text.strip() == "/cancel" and self._asking.pop(who, None):
+                    await self.send(who, "Nothing was sent to the owner.")
+                    raise ApplicationHandlerStop
+                if text.strip().casefold() in {
+                    "/start",
+                    "/help",
+                    "/access",
+                    "help",
+                    "what can i do",
+                    "what can i do?",
+                    "show my access",
+                    "show access details",
+                    "show my permissions",
+                }:
+                    await self.send(
+                        who,
+                        review(record["label"], record["scope"], service.catalog, service.zone)
+                        + "\n\nStatus: "
+                        + record["effective_status"],
+                        [
+                            [
+                                *(
+                                    []
+                                    if record["scope"].get(
+                                        "until_ended"
+                                    )  # no end date: nothing to renew
+                                    else [("Request more time", "hs:r:" + record["id"])]
+                                ),
+                                ("Request more access", "hs:q:" + record["id"]),
+                            ]
+                        ]
+                        if record["status"] != "revoked"
+                        else None,
+                    )
+                elif not service._fresh(record):
+                    buttons = (
+                        [[("Request renewal", "hs:r:" + record["id"])]]
+                        if record["status"] != "revoked"
+                        else None
+                    )
+                    await self.send(
+                        who,
+                        "The owner ended your access. Ask them for a new invitation."
+                        if record["status"] == "revoked"
+                        else "Your access has expired. Request more time below; the owner will review it.",
+                        buttons,
+                    )
+                elif text.strip().casefold() in {
+                    "/renew",
+                    "request more time",
+                    "extend my access",
+                    "i need more time",
+                }:
+                    await self.ask_for_more_time(
+                        who,
+                        record["id"],
+                        "Your request for more time is with the owner. Your current access stays unchanged until approved.",
+                    )
+                elif text == "/new":
+                    # New native session/context without changing or renewing authority.
+                    await asyncio.to_thread(self.runner.reset_context, who, record["id"])
+                    await self.send(
+                        who,
+                        "Started a fresh conversation. Your saved preferences and current permissions still apply."
+                        if record["scope"].get("guest_memory")
+                        else "Started a fresh conversation. Your current permissions still apply.",
+                    )
+                elif text.startswith("/"):
+                    await self.send(
+                        who,
+                        "Ask me to use the services listed in /access. Use /renew to request more time or /new for a fresh conversation. Other bot commands aren't available in guest chat.",
+                    )
+                else:
+                    sid = record["id"]
+                    if sid in self._guest_tasks and not self._guest_tasks[sid].done():
+                        await self.send(
+                            who,
+                            "I'm still working on your previous message. You can check /access while you wait.",
+                        )
+                    else:
+                        task = self.ctx.spawn_task(
+                            self.guest_turn(who, sid, text), name="hermes-guests-guest"
+                        )
+                        self._guest_tasks[sid] = task
+                        task.add_done_callback(
+                            lambda finished, _sid=sid: (
+                                self._guest_tasks.pop(_sid, None)
+                                if self._guest_tasks.get(_sid) is finished
+                                else None
+                            )
+                        )
+        except GuestsError as exc:
+            await self.send(who, str(exc))
+        raise ApplicationHandlerStop
+
+    async def never_word_answer(self, who, text):
+        """Take the owner's next message as the word they were asked for. This comes before
+        greetings and other shortcuts, so that any word can be listed; commands such as
+        /cancel are left to their own handling. True when the message was the answer."""
+        waiting = getattr(self, "_never_word", None)
+        if not waiting or text.startswith("/") or not text.strip():
+            return False
+        service = self.ensure()
+        if who != service.owner_id:
+            return False
+        self._never_word = None
+        if waiting["until"] > time.time():
+            try:
+                if waiting["tool"]:
+                    service.never_set(who, "scoped", text, True, tool=waiting["tool"])
+                else:
+                    service.never_set(who, "values", text, True)
+            except GuestsError as refused:
+                # Not accepted (too short, too long, the list is full). The prompt stays
+                # open, so the next try is taken as the word too and not as a message.
+                self._never_word = waiting
+                raise GuestsError(
+                    str(refused) + " Send another word, or /cancel to add nothing."
+                ) from refused
+            await self.never_card(who)
+            return True
+        if time.time() < waiting["until"] + 3600:
+            # A late answer to the prompt. It is not added, and it is not passed on to the
+            # assistant as if it were a message.
+            await self.send(
+                who,
+                "That took longer than ten minutes, so nothing was added and this "
+                "message was not passed on. Open the never-share list from /guests_setup to try again.",
+            )
+            return True
+        return False  # long past: an ordinary message again
+
+    async def name_answer(self, who, text):
+        """Take the owner's next message as the name asked for by Add a guest. True when
+        the message was the answer."""
+        waiting = getattr(self, "_name_prompt", None)
+        if not waiting or text.startswith("/") or not text.strip():
+            return False
+        service = self.ensure()
+        if who != service.owner_id:
+            return False
+        self._name_prompt = None
+        if waiting["until"] <= time.time():
+            return False  # long past: an ordinary message again
+        await self.wizard_start(who, plain_words(text, 80))
+        return True
+
+    async def setup_review(self, who):
+        service = self.ensure()
+        service.owner(who)
+        if hasattr(self.runner, "check_readiness"):
+            await asyncio.to_thread(self.runner.check_readiness)
+        tools = self.owner_tools(require_management=False)
+        missing_management = not MANAGEMENT_TOOLS <= tools.keys()
+        admitted = other_people(self.ctx, who)
+        # Someone who has, or had, their own access keeps it exactly as it is,
+        # ended access included: setup never gives back what ran out or was
+        # ended. Only people the unrestricted agent still answers are taken over.
+        current, ended = {}, {}
+        for r in sorted(service.list_access(who), key=lambda r: r.get("updated_at", 0)):
+            known = current if r.get("effective_status") == "active" else ended
+            known[str(r["guest_id"])] = r["label"]
+        ended = {g: label for g, label in ended.items() if g not in current}
+        kept = sorted(current[o["id"]] for o in admitted if o["id"] in current)
+        lapsed = sorted(ended[o["id"]] for o in admitted if o["id"] in ended)
+        others = [o for o in admitted if o["id"] not in current and o["id"] not in ended]
+        for person in others:
+            person["label"] = await self.display_name(person["id"], person["label"])
+        carried = self.shareable() if others else {}
+        # What each of them would get, prepared now so the card shows the exact
+        # inputs and accepting grants exactly this. None when nothing is shareable.
+        carried_scope = service.takeover_scope(sorted(carried)) if others and carried else None
+        self.pending_setup = {
+            "token": secrets.token_urlsafe(12),
+            "tools": tools,
+            "missing_management": missing_management,
+            "others": others,
+            "carried": sorted(carried),
+            "carried_scope": carried_scope,
+            "expires": time.time() + self.ensure().review_seconds,
+        }
+        summary = (
+            "Enable sharing for this Hermes?\n\nYour usual tools stay available:\n"
+            + "\n".join("• " + name.replace("_", " ") for name in tools)
+        )
+        if missing_management:
+            summary += "\n\nEnable sharing also adds Hermes Guests to your Telegram tools so you can manage invitations in chat."
+        if others:
+            summary += (
+                f"\n\n{len(others)} other "
+                + ("person" if len(others) == 1 else "people")
+                + " can already use this bot: "
+                + ", ".join(
+                    o["label"] if o["label"] == o["id"] else o["label"] + " (" + o["id"] + ")"
+                    for o in others
+                )
+                + ". Today they reach every tool you have. When you enable sharing, each of them gets a separate conversation and memory"
+                + (
+                    ", with no end date, and only these tools:\n"
+                    + "\n".join(
+                        line for entry in carried_scope["tools"] for line in review_lines(entry)
+                    )
+                    if carried_scope
+                    else ", and no tools: none of yours can be shared yet. They can use the bot again once you share something with them."
+                )
+                + "\nThey lose the tools that act on this computer or on Hermes itself (terminal, files, code, memory, scheduling). In group chats only you are answered. You can change or end each person's access afterwards."
+            )
+        if kept:
+            summary += (
+                "\n\nAccess you already gave stays exactly as it is: "
+                + ", ".join(kept)
+                + ". Send /guests to see or change it."
+            )
+        if lapsed:
+            summary += (
+                "\n\nAccess that ran out or that you ended stays ended: "
+                + ", ".join(lapsed)
+                + ". Send /guests_new and their name to share with them again."
+            )
+        summary += "\n\nGuests get only the access you approve, in separate conversations. You can check, change, or end their access at any time."
+        summary += (
+            "\n\nSetup creates a warrant for your reviewed tools and renews it automatically."
+        )
+        if self.ctx.get_config("require_owner_warrant", False) is True:
+            summary += " You require this warrant for your tools. Review newly enabled tools here."
+        setup_message = await self.send(
+            who, summary, [[("Enable sharing", "hs:s:" + self.pending_setup["token"])]]
+        )
+        self.pending_setup["message_id"] = setup_message.message_id
+        if service.owner_ready():
+            await self.setup_sections(who, "Also in setup, separate from the tools above:")
+
+    async def setup_sections(self, who, text):
+        """The parts of setup besides the tools: the never-share list and guest data."""
+        service = self.ensure()
+        never = service.never()
+        listed = len(never.tools) + len(never.values) + len(never.scoped)
+        kept = service.data_settings(who)["retention_seconds"]
+        await self.send(
+            who,
+            text
+            + "\n\nNever-share list: "
+            + (f"{listed} " + ("entry" if listed == 1 else "entries") if listed else "empty")
+            + "\nGuest data: conversations and memories are "
+            + kept_text(kept),
+            [
+                [("Never-share list", "hs:N:list")],
+                [("Guest data", "hs:D:settings")],
+                [
+                    ("Simple access cards", "hs:F:simple"),
+                    ("Detailed access cards", "hs:F:detailed"),
+                ],
+            ],
+        )
+
+    async def group_message(self, update, context):
+        from telegram.ext import ApplicationHandlerStop
+
+        user = update.effective_user
+        if user is None:
+            return
+        with own_profile():
+            try:
+                service = self.ensure()
+                configured, owner = service.owner_configured(), service.owner_id
+            except Exception:
+                # Sharing cannot start (a missing key after a restore, unreadable state). If
+                # it was ever set up, other people stay out until the owner has repaired it.
+                configured = self.configured_before()
+                try:
+                    owner = owner_identity(self.ctx)
+                except Exception:
+                    owner = None
+        # Once sharing has been set up, other people stay out of the unrestricted agent
+        # even while the owner's own setup needs attention.
+        if not configured or str(user.id) == str(owner):
+            return
+        raise ApplicationHandlerStop
+
+    def configured_before(self):
+        """True if this Hermes has saved sharing state with an owner setup in it, read
+        without starting sharing. Only state that is plainly absent, or plainly ours with
+        no setup yet, counts as not set up; anything unreadable or unexpected counts as
+        set up, so the gate stays closed."""
+        try:
+            saved = self.ctx.state.get("access", None)
+            if saved is None:
+                return False
+            setup = saved["setup"] if saved.get("version") == 1 else None
+            if not isinstance(setup, dict):
+                return True
+            # After a recovery the owner's grant is gone until setup is repeated, but the
+            # recovery's mark remains: other people stay out in the meantime.
+            return bool(
+                setup.get("sharing_enabled")
+                or setup.get("owner_authority")
+                or setup.get("trust_generation")
+                or saved.get("shares")
+                or saved.get("invites")
+            )
+        except Exception:
+            return True
+
+    async def guest_menu(self, who):
+        from telegram import BotCommand, BotCommandScopeChat
+
+        try:
+            await self.app.bot.set_my_commands(
+                [
+                    BotCommand("help", "What can I do?"),
+                    BotCommand("access", "My permissions"),
+                    BotCommand("renew", "Request more time"),
+                    BotCommand("new", "Fresh conversation"),
+                ],
+                scope=BotCommandScopeChat(chat_id=int(who)),
+            )
+        except Exception:
+            logging.getLogger(__name__).warning("Guest command menu could not be updated")
+
+    async def guest_turn(self, who, sid, text):
+        async def typing():
+            while True:
+                try:
+                    await self.app.bot.send_chat_action(chat_id=int(who), action="typing")
+                except Exception:
+                    pass
+                await asyncio.sleep(4)
+
+        indicator = asyncio.create_task(typing())
+        try:
+            result = await asyncio.to_thread(self.runner.run, who, sid, text)
+            await self.send(who, result)
+        except GuestsError as exc:
+            await self.send(who, str(exc))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self.report_problem(who, exc)
+        finally:
+            indicator.cancel()
+            await asyncio.gather(indicator, return_exceptions=True)
+
+    async def status(self, who):
+        service = self.ensure()
+        service.owner(who)
+        records = service.list_access(who)
+        await self.send(
+            who,
+            "Shared access\n\n"
+            + (
+                "\n".join(
+                    r["label"]
+                    + ": "
+                    + r["effective_status"]
+                    + (
+                        "; no end date"
+                        if r["scope"].get("until_ended")
+                        else "; ends " + r["scope"]["expires_at"]
+                    )
+                    for r in records
+                )
+                or "No guests have access yet. Tell me who should use which services and for how long."
+            ),
+            [
+                [("Add a guest", "hs:h:add"), ("Check sharing", "hs:h:check")],
+                [("Activity", "hs:h:activity")],
+            ],
+        )
+        for record, request in service.open_requests(who):
+            await self.more_card(record["label"], record["id"], request["token"], request["words"])
+        for record in records:
+            await self.send(
+                who,
+                record["label"] + " — " + record["effective_status"],
+                [[("Manage access", "hs:v:" + record["id"])]],
+            )
+        db = service.ledger.snapshot()
+        for p in db["proposals"].values():
+            if p["status"] == "pending" and p["valid_until"] > service.clock():
+                text = service.proposal_review(p)
+                await self.proposal_card({"proposal_id": p["id"], "text": text})
+        groups = {}
+        for key, inv in db["invites"].items():
+            groups.setdefault(inv["proposal_id"], []).append((key, inv))
+        for pid, items in groups.items():
+            p = db["proposals"].get(pid)
+            if not p or any(spent(i) for _, i in items):
+                continue
+            claims = [
+                (k, i)
+                for k, i in items
+                if i["status"] == "claimed" and i["claim_until"] > service.clock()
+            ]
+            if claims:
+                key, inv = max(claims, key=lambda pair: pair[1]["claim_until"])
+                label = inv["guest_label"] + (
+                    " · @" + inv["guest_username"] if inv.get("guest_username") else ""
+                )
+                await self.claim_card(
+                    key,
+                    inv["guest_id"],
+                    label,
+                    review(p["label"], p["scope"], service.catalog, service.zone),
+                )
+            else:
+                try:
+                    service.normalize_scope(p["scope"], saved=True)
+                except GuestsError:
+                    await self.send(
+                        who,
+                        "The invitation for "
+                        + p["label"]
+                        + " needs a fresh access review before it can be reused.",
+                    )
+                    continue
+                await self.send(
+                    who,
+                    "Invitation for "
+                    + p["label"]
+                    + ". If its link was lost, expired, or claimed by the wrong account, replace it below. The approved permissions and end time stay the same.",
+                    [[("Replace invitation link", "hs:i:" + pid)]],
+                )
+
+    async def data_card(self, who):
+        service = self.ensure()
+        settings = service.data_settings(who)
+        await self.send(
+            who,
+            "Guest data after access ends\n\n"
+            + (
+                "Keep until you delete it."
+                if settings["retention_seconds"] is None
+                else "Delete "
+                + service.retention_text(settings["retention_seconds"])
+                + " after access ends."
+            )
+            + "\n\nEnding access blocks chats and tools. Keeping data lets you restore personalization when you authorize the guest again.\n\n"
+            "Open a guest in /guests to delete their data now. Security and audit records are retained separately.",
+            [
+                [("Keep until I delete", "hs:R:forever")],
+                [("Delete after access ends", "hs:R:0")],
+                [("Keep 1 day", "hs:R:86400"), ("Keep 7 days", "hs:R:604800")],
+                [("Keep 30 days", "hs:R:2592000")],
+            ],
+        )
+
+    async def housekeeping(self):
+        while True:
+            try:
+                with own_profile(saved=True):  # this loop's context is as old as the gateway
+                    if self.configured_before():
+                        if self.service is None:
+                            await asyncio.to_thread(self.ensure)
+                        await asyncio.to_thread(self.service.maintenance, self.service.owner_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "Sharing maintenance needs attention (%s)", type(exc).__name__
+                )
+            await asyncio.sleep(60)
+
+    def telegram_factory(self, application, adapter):
+        from telegram.ext import CallbackQueryHandler, MessageHandler, filters
+
+        self.app = application
+        self.loop = asyncio.get_running_loop()
+        if self._maintenance_task is None:
+            self._maintenance_task = self.ctx.spawn_task(
+                self.housekeeping(), name="hermes-guests-maintenance"
+            )
+        application.add_handler(CallbackQueryHandler(self.callback, pattern=r"^hs:"), group=-50)
+        application.add_handler(MessageHandler(filters.ChatType.PRIVATE, self.message), group=-50)
+        # Outside private chats Hermes Guests has no scoped conversation to offer, so there only the
+        # owner reaches the agent; everyone else the bot admits is stopped here.
+        application.add_handler(
+            MessageHandler(~filters.ChatType.PRIVATE, self.group_message), group=-50
+        )
+
+    def close(self):
+        if self._maintenance_task:
+            self._maintenance_task.cancel()
+        for task in self._guest_tasks.values():
+            task.cancel()
+        if self.runner and hasattr(self.runner, "close"):
+            self.runner.close()
+        if self.broker:
+            self.broker.close()
+
+
+def register(ctx):
+    from . import _register_skill
+
+    _register_skill(ctx)
+    plugin = GuestsPlugin(ctx)
+    rule = {
+        "description": 'One rule for one input: {"equals": value}, {"one_of": [values]}, {"range": [low, high]} or {"any": true}.',
+    }
+    schema = {
+        "type": "object",
+        "properties": {
+            "person": {"type": "string", "maxLength": 80},
+            "share_id": {
+                "type": "string",
+                "description": "Only when changing or ending existing access.",
+            },
+            "action": {"type": "string", "enum": ["replace", "revoke", "delete"]},
+            "invitation_seconds": {
+                "type": "integer",
+                "minimum": 60,
+                "maximum": 86400,
+                "description": "For a new invitation, how long the guest has to open it after sending, capped by access expiry. For 'a day to accept', use 86400. Independent of access duration. Omit to use the operator default. Existing guest updates do not need another invitation.",
+            },
+            "scope": {
+                "type": "object",
+                "description": 'What the person may use and for how long. Example: {"tools": [{"name": "library_find", "constraints": {"library": {"equals": "Movies"}, "query": {"any": true}, "limit": {"range": [1, 5]}}}], "duration_seconds": 3600}',
+                "properties": {
+                    "chat_only": {
+                        "type": "boolean",
+                        "description": "Allow conversation with zero tools or delegation.",
+                    },
+                    "lights": {"type": "array", "items": {"type": "string"}},
+                    "research": {"type": "boolean"},
+                    "tools": {
+                        "type": "array",
+                        "maxItems": 32,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "constraints": {
+                                    "type": "object",
+                                    "description": "A rule for every required input of the tool, keyed by input name. Inputs left out are not available to the guest.",
+                                    "additionalProperties": rule,
+                                },
+                            },
+                            "required": ["name", "constraints"],
+                        },
+                    },
+                    "expires_at": {
+                        "type": "string",
+                        "description": "Exact end time including timezone; preserve this when changing existing access.",
+                    },
+                    "duration_seconds": {
+                        "type": "integer",
+                        "minimum": 6,
+                        "maximum": 2592000,
+                        "description": "For a relative duration, Hermes Guests computes and freezes the exact end time when preparing the review. Use instead of expires_at.",
+                    },
+                    "until_ended": {
+                        "type": "boolean",
+                        "description": "true for access with no end date, which lasts until the owner ends it. Use instead of a duration or end time when the owner asks for permanent or ongoing access.",
+                    },
+                },
+            },
+        },
+        "required": ["person"],
+    }
+    never_schema = {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["add", "remove"]},
+            "kind": {"type": "string", "enum": ["tool", "word"]},
+            "value": {
+                "type": "string",
+                "description": "The exact tool name for kind tool, or the word or phrase for kind word.",
+            },
+            "tool": {
+                "type": "string",
+                "description": "Only for kind word: limit the word to this tool's inputs.",
+            },
+            "input": {
+                "type": "string",
+                "description": "Only with tool: limit the word to this one input of the tool.",
+            },
+        },
+        "required": ["action", "kind", "value"],
+        "additionalProperties": False,
+    }
+    descriptions = DESCRIPTIONS
+    for name, description in descriptions.items():
+        parameters = (
+            never_schema
+            if name == "guests_never"
+            else {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["inspect", "retention", "delete"]},
+                    "retention_seconds": {
+                        "type": ["integer", "null"],
+                        "minimum": 0,
+                        "maximum": 31536000,
+                        "description": "null keeps data until explicit deletion (default). An integer opts into deletion that many seconds after access ends.",
+                    },
+                    "person": {"type": "string"},
+                    "share_id": {"type": "string"},
+                },
+                "additionalProperties": False,
+            }
+            if name == "guests_data"
+            else {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "cursor": {"type": "integer", "minimum": 0},
+                },
+            }
+            if name == "guests_discover"
+            else schema
+            if name == "guests_prepare_access"
+            else (
+                {
+                    "type": "object",
+                    "properties": {
+                        "person": {
+                            "type": "string",
+                            "description": "The person's name, as in guests_list_access.",
+                        },
+                        "share_id": {"type": "string"},
+                        "scope": {"type": "string", "enum": ["guest", "owner", "all"]},
+                        "timezone": {
+                            "type": "string",
+                            "description": "Requested IANA timezone, or EST for fixed UTC-05:00. Omit for the profile timezone.",
+                        },
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    },
+                }
+                if name == "guests_activity"
+                else {"type": "object", "properties": {}, "additionalProperties": False}
+            )
+        )
+
+        async def handler(args, _name=name, **_kw):
+            return await plugin.tool(_name, args)
+
+        ctx.register_tool(
+            name,
+            "hermes_guests",
+            {"name": name, "description": description, "parameters": parameters},
+            handler,
+            is_async=True,
+            description=description,
+        )
+
+    async def guests_command(raw_args="", **_kw):
+        try:
+            who = actor()
+            service = plugin.ensure()
+            if who == service.owner_id:
+                await plugin.status(who)
+                return None
+            r = service.guest(who)
+            return (
+                review(r["label"], r["scope"], service.catalog, service.zone)
+                + "\n\nStatus: "
+                + r["effective_status"]
+            )
+        except GuestsError as exc:
+            return str(exc)
+
+    ctx.register_command(
+        "guests", guests_command, description="Inspect shared access and pending approvals"
+    )
+    ctx.register_telegram_handler(plugin.telegram_factory)
+    ctx.register_hook("pre_tool_call", plugin.owner_boundary)
+    ctx.register_hook("pre_llm_call", plugin.owner_turn_context)
+    if hasattr(ctx, "on_unload"):
+        ctx.on_unload(plugin.close)

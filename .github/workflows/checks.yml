@@ -1,0 +1,70 @@
+name: Checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: Hermes ${{ matrix.hermes.version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each entry is a Hermes release tag and the commit it points at.
+        # To add or move a version: git ls-remote https://github.com/NousResearch/hermes-agent 'refs/tags/<tag>^{}'
+        hermes:
+          - version: v0.22.6
+            commit: f0d94882e89ab8d4098b5bb2f166adfb9ee0a0ab
+          - version: v0.23.1
+            commit: 3b421578588243f920886e6fe79a6faa87ea026e
+    steps:
+      - name: Check out Hermes Guests
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: share
+          persist-credentials: false
+
+      - name: Check out Hermes ${{ matrix.hermes.version }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ matrix.hermes.commit }}
+          path: hermes-agent
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: hermes-agent/uv.lock
+
+      # Hermes pins its dependencies through its own lockfile, so it is
+      # installed from its checkout and Hermes Guests is added to that environment.
+      - name: Install Hermes
+        working-directory: hermes-agent
+        run: uv sync --frozen --no-dev
+
+      - name: Install Hermes Guests
+        working-directory: share
+        run: uv pip install --no-config --python ../hermes-agent/.venv/bin/python -e ".[test]"
+
+      - name: Run checks
+        working-directory: share
+        env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-home
+        run: ../hermes-agent/.venv/bin/python scripts/check.py
+
+      - name: Test the README install
+        working-directory: share
+        run: bash scripts/test-install.sh "$GITHUB_WORKSPACE/hermes-agent"

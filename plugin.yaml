@@ -1,0 +1,36 @@
+name: hermes-guests
+version: 0.1.0rc3
+description: >-
+  Share selected services with Telegram guests through native confirmations,
+  isolated guest agents, and local Tenuo enforcement. Development preview.
+author: Tenuo AI
+license: Apache-2.0
+kind: standalone
+homepage: https://github.com/tenuo-ai/hermes-guests
+requires_hermes: ">=0.22.6"
+requires_auth:
+  - openai-codex
+optional_env:
+  - OPENAI_API_KEY
+  - OPENROUTER_API_KEY
+  - ANTHROPIC_API_KEY
+  - GOOGLE_API_KEY
+  - GEMINI_API_KEY
+  - DEEPSEEK_API_KEY
+  - XAI_API_KEY
+python_dependencies:
+  - "hermes-tenuo==0.4.0"
+  - "tenuo==0.3.7"
+  - "jsonschema>=4.18,<5"
+provides_tools:
+  - guests_discover
+  - guests_prepare_access
+  - guests_list_access
+  - guests_activity
+  - guests_repair
+  - guests_status
+  - guests_data
+  - guests_never
+provides_hooks:
+  - pre_tool_call
+  - pre_llm_call

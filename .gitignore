@@ -1,0 +1,25 @@
+# Private runtime and local configuration
+.env
+.env.*
+!.env.example
+state/
+runtime/
+evidence/
+secrets/
+*.key
+*.warrant
+*.srl
+__pycache__/
+.pytest_cache/
+.venv/
+.DS_Store
+build/
+dist/
+*.egg-info/
+
+# Local validation output
+.ruff_cache/
+.coverage
+htmlcov/
+*.log
+*.jsonl
