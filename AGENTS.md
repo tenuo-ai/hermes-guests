@@ -40,5 +40,8 @@ Read [README.md](README.md), [CONTRIBUTING.md](CONTRIBUTING.md),
   to an existing deployment or messages to real people need explicit authorization.
 - Keep credentials, personal identifiers, transcripts and runtime state out of Git.
   Use synthetic examples in fixtures and documentation.
+- This repository is public. Docs, comments, test names, commit messages and PR
+  descriptions should make sense to outside users. `scripts/check_public.py` (part
+  of `scripts/check.py`) flags personal emails, local paths and credentials.
 - Distinguish automated fixtures, hosted-model checks, live Telegram delivery,
   actual service effects and observed usability. Report failures and skipped checks.
