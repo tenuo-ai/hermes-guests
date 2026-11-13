@@ -21,6 +21,7 @@ def main():
         raise SystemExit(
             "Native Hermes is required for the readiness gate. Install it in this environment or set PYTHONPATH to its checkout."
         )
+    run("scripts/check_public.py")
     run("-m", "ruff", "check", "hermes_guests", "tests", "scripts")
     run("-m", "ruff", "format", "--check", "hermes_guests", "tests", "scripts")
     run("-m", "unittest", "discover", "-s", "tests", "-v")
