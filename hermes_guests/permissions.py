@@ -138,7 +138,14 @@ def validate_schema(schema):
         raise GuestsError("The tool input schema needs repair before sharing.") from exc
     return {
         "name": name,
-        "description": str(schema.get("description", name))[:3000],
+        # Kept whole up to a generous bound; a longer one is marked as cut, never silently
+        # shortened, so a review can't look complete when it isn't.
+        "description": (
+            str(schema.get("description", name))
+            if len(str(schema.get("description", name))) <= 3000
+            else str(schema.get("description", name))[:3000]
+            + " … [description cut at 3000 characters; check the tool before sharing it]"
+        ),
         "parameters": params,
     }
 
