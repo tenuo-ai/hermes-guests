@@ -4,7 +4,9 @@
 
 Install/enable through the Hermes environment. The existing owner opens the private
 bot chat. Hermes Guests checks its identity, native API/model readiness, and enabled tools;
-the owner reviews and enables sharing. Local keys and state are automatic. Setup
+the owner reviews and enables sharing. The setup card says what sharing lets the
+owner do and that hermes-tenuo sets up sensible default Tenuo warrants; **Details**
+lists the owner's tools and the warrant behind them. Local keys and state are automatic. Setup
 then offers the never-share list and how long guest data is kept after access
 ends; both are optional and can be changed later in `/guests_setup`.
 Broad native allow-all/pairing must not coexist with scoped guest access.
@@ -58,10 +60,40 @@ permissions; it leads to the usual review. “What can Alex do?” “Also allow
 controls.” “Another day.” “End Alex's access.” Each root change shows a complete
 new review. Expansions preserve the end time unless the owner changes it.
 
+A length of time ("15 minutes", "a week") starts when the owner approves: for a new
+guest, when the owner confirms their account. More time on access that is still on
+("another hour") is added to the current end, from the Extend button, from chat, or
+when the guest asks; once access has ended it runs from approval. Reviews say "Lasts 15 minutes from
+approval" and show where it would end if approved now. Access of a day or more gets a
+24-hour invitation window by default.
+
 Guest: `/access` shows actual permissions and expiry; `/new` resets conversation
-context without extending access. Expired guests get a renewal button. `/renew`
-requests more time, with a full review sent to the owner and no automatic extension.
-Revoked guests need a new invitation. Both parties are notified of changes.
+context without extending access. Guests get a message about two minutes before
+access ends and another when it ends, with the exact time and a Request more time
+button. Asking for more time offers the length the owner chose last time, 1 hour or
+1 day, or the guest types a length such as "6 hours". The owner sees "Alex asks for
+15 minutes more", can change the length before approving, and no extension happens
+automatically. Revoked guests need a new invitation. Both parties are notified of
+changes.
+
+Times: every message is written for the person reading it. A guest's messages use
+their own time zone when the owner gives it ("Mom is in Vancouver") or the guest
+says where they are; otherwise the owner's. The welcome says which time zone is
+shown. The guest's model is told the current time and when access ends, and that
+refusals from before a renewal no longer apply.
+
+Names: the owner's name for a guest stays, and the claim card shows their Telegram
+account beside it ("Someone opened your invitation for Mom. Telegram account:
+Linda"). Set `guest_names: telegram` to use Telegram names once guests join.
+
+Requests: a guest has one request open at a time. Only requests the owner declines
+count: after three in a day the guest waits until the next day. When the owner
+approves any change to that guest's access, an open request for more is answered.
+
+Cards: by default a review opens with what is being decided ("Share with Alex?",
+"Alex asks for 15 minutes more") and the access in plain words. **Details** shows the
+exact rules. Activity is a plain summary of recent events with a **Full log** button;
+readable activity is kept for 90 days by default (`activity_retention_days`).
 
 ## While work is running
 
