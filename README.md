@@ -90,7 +90,7 @@ conversations, memory, and access records locally in separate profiles.
 
 ## Contribute
 
-Try the [sharing scenarios](docs/human-test.md),
+Try the [sharing scenarios](docs/scenarios.md),
 [report an issue](https://github.com/tenuo-ai/hermes-guests/issues), or read
 [CONTRIBUTING.md](CONTRIBUTING.md) to work on the code.
 
