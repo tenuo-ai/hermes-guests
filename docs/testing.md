@@ -54,7 +54,7 @@ To test a different committed source, pass its Git URL as the second argument.
 To run with the official Home Assistant plugin against a simulated service,
 install its Python dependencies in the Hermes environment and pass the plugin
 directory as the third argument. For live testing, use a dedicated bot and the
-[sharing scenarios](human-test.md).
+[sharing scenarios](scenarios.md).
 
 ## Acceptance checklist
 
@@ -119,7 +119,7 @@ remain part of live acceptance.
 ## Engineering acceptance
 
 A human test begins with the repository README and the tester's own
-Hermes installation. [Sharing scenarios](human-test.md)
+Hermes installation. [Sharing scenarios](scenarios.md)
 
 Use an isolated engineering instance, recording integrations and consenting
 participants for fault injection and deterministic boundary checks. Verify

@@ -18,5 +18,5 @@ the model discover and draft; trusted code owns validation, review, issuance,
 identity binding, scope changes, and enforcement.
 
 Run `python scripts/check.py` with native Hermes and the test extras installed to
-execute the pre-human-test gate. Tests use recording services and a recording bot;
+run the automated checks. Tests use recording services and a recording bot;
 passing them is not a claim of live Telegram/device acceptance. See testing.md.
