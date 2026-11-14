@@ -34,8 +34,9 @@ Your ordinary Hermes commands remain available in your owner chat.
 
 Guests can also say “What can I do?” or “Request access to …”, and use
 **Request more access** or **Request more time**. Access changes require owner
-approval. A guest can have one request open at a time and make three a day, for
-more access and for more time alike. After access is ended, the owner can send a
+approval. A guest can have one request open at a time. Only requests the owner
+declines count: after three declines in a day, for more access or more time alike,
+the guest waits until the next day. After access is ended, the owner can send a
 new invitation.
 
 ## Never-share list

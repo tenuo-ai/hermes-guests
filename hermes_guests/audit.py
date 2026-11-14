@@ -16,8 +16,10 @@ from .store import atomic_private, private_dir
 
 
 class Audit:
-    def __init__(self, root, key, trusted_root):
+    def __init__(self, root, key, trusted_root, retention_days=90):
         self.root = private_dir(Path(root) / "audit")
+        # Readable activity is kept by age, so a busy week does not push out last month.
+        self.retention_seconds = int(retention_days) * 86400
         self.events = self.root / "activity.jsonl"
         self.segment = uuid.uuid4().hex
         self.receipt_path = self.root / (self.segment + ".receipts.jsonl")
@@ -40,9 +42,7 @@ class Audit:
         }
         with self.lock:
             if self.events.exists() and self.events.stat().st_size > 5_000_000:
-                # Keep bounded readable activity; receipt segments remain separate evidence.
-                previous = self.root / "activity.previous.jsonl"
-                os.replace(self.events, previous)
+                self._close_current(item["at"])
             fd = os.open(self.events, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
             with os.fdopen(fd, "a") as stream:
                 stream.write(json.dumps(item, separators=(",", ":")) + "\n")
@@ -112,18 +112,81 @@ class Audit:
                 receipt_segment=self.receipt_path.name,
             )
 
-    def list(self, share_id, limit=50, *, actor=None):
-        rows = []
+    def files(self):
+        """Readable activity, oldest first: the file from older versions, closed files,
+        then the current one."""
+        closed = sorted(
+            (p for p in self.root.glob("activity.*.jsonl") if p.name.split(".")[1].isdigit()),
+            key=lambda p: int(p.name.split(".")[1]),
+        )
+        return [self.root / "activity.previous.jsonl", *closed, self.events]
+
+    def _close_current(self, now):
+        """Close the current file. Closed files are kept, named by when they were closed,
+        until they age out. Receipt segments remain separate evidence."""
+        stamp = int(now)
+        while (self.root / f"activity.{stamp}.jsonl").exists():
+            stamp += 1  # never overwrite: two closes in one second get the next name
+        os.replace(self.events, self.root / f"activity.{stamp}.jsonl")
+        self.prune(now)
+
+    def upkeep(self, now):
+        """Apply retention by age however quiet the log is: the current file is closed
+        once its first event is a day old, and closed files are removed after the
+        retention period. Reading also leaves out anything older."""
         with self.lock:
-            for path in (self.root / "activity.previous.jsonl", self.events):
-                if path.exists():
-                    for line in path.read_text().splitlines():
-                        try:
-                            record = json.loads(line)
-                        except ValueError:
-                            continue
-                        if (share_id is None or record.get("share_id") == share_id) and (
-                            actor is None or str(record.get("actor")) == str(actor)
-                        ):
-                            rows.append(record)
-        return rows[-min(max(limit, 1), 100) :]
+            try:
+                with open(self.events) as stream:
+                    first = json.loads(stream.readline() or "{}").get("at")
+            except (OSError, ValueError):
+                first = None
+            if isinstance(first, (int, float)) and first < now - 86400:
+                self._close_current(now)
+            else:
+                self.prune(now)
+
+    def prune(self, now):
+        """Remove closed files whose newest event is older than the retention period."""
+        for path in self.files()[:-1]:
+            try:
+                if path.exists() and path.stat().st_mtime < now - self.retention_seconds:
+                    path.unlink()
+            except OSError:
+                pass
+
+    def list(self, share_id, limit=50, *, actor=None, since=None):
+        """Matching events, oldest first, at most `limit` of the newest. Files are read
+        newest first and reading stops once enough are found or older ones are out of
+        range, so a short query does not scan every retained file."""
+        import time
+
+        limit = min(max(limit, 1), 1000)
+        oldest = time.time() - self.retention_seconds
+        since = oldest if since is None else max(since, oldest)
+        found = []
+        with self.lock:
+            for path in reversed(self.files()):
+                if not path.exists():
+                    continue
+                try:
+                    if path != self.events and path.stat().st_mtime < since:
+                        break  # this file and every older one ended before the range
+                    lines = path.read_text().splitlines()
+                except OSError:
+                    continue
+                for line in reversed(lines):
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        continue
+                    if (
+                        (share_id is None or record.get("share_id") == share_id)
+                        and (actor is None or str(record.get("actor")) == str(actor))
+                        and record.get("at", 0) >= since
+                    ):
+                        found.append(record)
+                        if len(found) >= limit:
+                            break
+                if len(found) >= limit:
+                    break
+        return found[::-1]
