@@ -25,7 +25,11 @@ EXAMPLE_DOMAINS = ("example.com", "example.org", "example.net", "example", "inva
 PLACEHOLDER_USERS = {"alex", "blair", "user", "you", "example", "runner"}
 
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9-]+\.)+[A-Za-z]{2,}")
-LOCAL_PATH = re.compile(r"(?:/Users/|/home/|[A-Za-z]:[/\\]+Users[/\\]+)([A-Za-z0-9._-]+)")
+LOCAL_PATH = re.compile(
+    r"(?:/Users/|/home/|[A-Za-z]:[/\\]+Users[/\\]+)([A-Za-z0-9._-]+)", re.IGNORECASE
+)
+# Screenshots and recordings can't be checked as text. Review them before publishing.
+MEDIA_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".webm", ".mov"}
 TAILNET_HOST = re.compile(r"\b[A-Za-z0-9-]+\.[A-Za-z0-9-]+\.ts\.net\b")
 REPOSITORY = re.compile(r"\btenuo-ai/([A-Za-z0-9_.-]+)", re.IGNORECASE)
 SECRETS = re.compile(
@@ -77,6 +81,8 @@ def line_findings(line, extra):
 def check(paths, extra=()):
     findings = []
     for path in paths:
+        if path.suffix.lower() in MEDIA_SUFFIXES and not path.is_symlink():
+            continue
         try:
             # Git stores a symlink's target, so check that instead of following it.
             text = (

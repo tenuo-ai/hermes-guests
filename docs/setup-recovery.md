@@ -21,6 +21,11 @@ install Hermes Guests by itself in the environment used for sharing.
 If a source scan asks for review, inspect the reported files before confirming.
 Hermes Guests launches isolated guest workers; its tests contain Unicode permission labels.
 
+After updating Hermes Guests, send `/new` in your Telegram chat before your next
+sharing request. Hermes keeps an open chat's tool descriptions until a new session
+starts, so an old chat can describe the previous version. Hermes Guests reminds you
+once when its tools have changed.
+
 ## Model setup
 
 Use `hermes model` in the owner profile to select the model for guest turns.
@@ -133,7 +138,7 @@ reuse retained personalization. A new approved invitation after deletion starts
 with a fresh profile. Unrelated profiles and security/audit evidence remain.
 Actions already in progress may finish. Later calls and stale replies are stopped.
 
-[The human-test guide](human-test.md) covers setup, changes, renewal, restarts,
+[The sharing scenarios](scenarios.md) cover setup, changes, renewal, restarts,
 repair, and cleanup. Test identity recovery separately with disposable authority.
 Use [development testing](testing.md) for fixture and model checks. Record
 actual Telegram delivery and connected-service results separately.

@@ -90,12 +90,21 @@ def tidy(args, resolver):
         if alias in args and isinstance(args[alias], str):
             args.setdefault("person", args[alias])
             args.pop(alias)
-    extra = set(args) - {"person", "share_id", "action", "scope", "invitation_seconds"}
+    extra = set(args) - {
+        "person",
+        "share_id",
+        "action",
+        "scope",
+        "invitation_seconds",
+        "add_seconds",
+        "guest_time_zone",
+    }
     if extra:
         raise GuestsError(
             "Unknown fields: "
             + ", ".join(sorted(extra))
-            + ". Use person, action, share_id, invitation_seconds and scope; "
+            + ". Use person, action, share_id, invitation_seconds, add_seconds, "
+            "guest_time_zone and scope; "
             "inside scope use tools and one of duration_seconds, expires_at or until_ended."
         )
     tools = scope.get("tools")

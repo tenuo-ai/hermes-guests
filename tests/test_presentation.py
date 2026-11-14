@@ -82,7 +82,7 @@ class PermissionCardTests(unittest.TestCase):
             self.assertIn(name + "\n• Turn off or turn on", text)
         for raw in ("Domain", "Permission group", "device_control", '"turn_on"'):
             self.assertNotIn(raw, text)
-        self.assertIn("Ends ", text)
+        self.assertIn("Lasts 1 hour from approval", text)
 
     def test_descriptions_survive_restart_renewal_and_permission_checks(self):
         sid = self.activate(device_selection())

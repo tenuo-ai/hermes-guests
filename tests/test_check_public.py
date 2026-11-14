@@ -23,6 +23,7 @@ class PublicContentTests(unittest.TestCase):
             "see tenuo-ai/" + "private-planning",
             "key ghp_" + "a" * 30,
             "see https://github.com/Tenuo-AI/" + "private-planning",
+            "c:\\" + "users\\someone\\file",
             '{"path": "C:\\\\' + 'Users\\\\someone\\\\file"}',
         ):
             self.assertTrue(findings(line), line)
@@ -52,6 +53,20 @@ class PublicContentTests(unittest.TestCase):
             path = Path(directory) / "data.csv"
             path.write_bytes(("caf\u00e9,someone" + "@" + "personal-mail.net").encode("cp1252"))
             self.assertTrue(check_public.check([path]))
+
+    def test_skips_media_but_not_text_or_media_symlinks(self):
+        secret = "someone" + "@" + "personal-mail.net"
+        with tempfile.TemporaryDirectory(dir=check_public.ROOT) as directory:
+            root = Path(directory)
+            (root / "shot.PNG").write_bytes(b"\x89PNG " + secret.encode())
+            (root / "clip.mp4").write_bytes(secret.encode())
+            (root / "notes.txt").write_text(secret)
+            (root / "link.png").symlink_to("/" + "home/someone/shot.png")
+            found = check_public.check(sorted(root.iterdir()))
+        self.assertEqual(
+            sorted(line.split(":", 1)[0].rsplit("/", 1)[1] for line in found),
+            ["link.png", "notes.txt"],
+        )
 
     def test_extra_patterns(self):
         pattern = check_public.re.compile("codename", check_public.re.IGNORECASE)

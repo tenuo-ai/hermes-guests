@@ -136,8 +136,95 @@ def scope(value, *, now, catalog, parent=None):
     return result
 
 
-def simple_access(access, catalog, zone="UTC"):
+def when(value, zone="UTC"):
+    """A moment as people read it, in their own clock: "Fri 13 Nov, 11:52 PM EST"."""
     from zoneinfo import ZoneInfo
+
+    at = datetime.fromtimestamp(timestamp(value), ZoneInfo(zone))
+    return at.strftime("%a %d %b, %I:%M %p %Z").replace(" 0", " ")
+
+
+def length_text(seconds):
+    """A length of time in words: "15 minutes", "2 hours 30 minutes", "7 days"."""
+    seconds = int(seconds)
+    parts = []
+    for size, unit in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        amount, seconds = divmod(seconds, size)
+        if amount:
+            parts.append(f"{amount} {unit}{'s' if amount != 1 else ''}")
+    return " ".join(parts[:2]) or f"{seconds} seconds"
+
+
+def parse_length(text):
+    """A length a person typed ("6 hours", "an hour", "1h30m", "2 days") in seconds, or
+    None. Only plain amounts and units; anything else is asked again."""
+    import re
+
+    units = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+    text = re.sub(r"\b(an?|one)\s+(?=(min|hour|day|week))", "1 ", text.casefold())
+    total, found = 0, False
+    for amount, unit in re.findall(
+        r"(\d+(?:\.\d+)?)\s*(m|mins?|minutes?|h|hrs?|hours?|d|days?|w|weeks?)(?![a-z])", text
+    ):
+        total += float(amount) * units[unit[0]]
+        found = True
+    return int(total) if found and total >= 60 else None
+
+
+def end_text(access, zone="UTC"):
+    """When access ends. A reviewed length starts when the owner approves."""
+    if access.get("until_ended"):
+        return "No end date. Access continues until the owner ends it."
+    if access.get("duration_seconds"):
+        return (
+            "Lasts "
+            + length_text(access["duration_seconds"])
+            + " from approval (until "
+            + when(access["expires_at"], zone)
+            + " if approved now)"
+        )
+    return "Ends " + when(access["expires_at"], zone)
+
+
+HA_ACTION_WORDS = {
+    "media_play": "play",
+    "media_pause": "pause",
+    "media_stop": "stop",
+    "media_play_pause": "play or pause",
+    "media_next_track": "skip to the next track",
+    "media_previous_track": "go back a track",
+    "volume_up": "turn the volume up",
+    "volume_down": "turn the volume down",
+    "volume_set": "set the volume",
+    "volume_mute": "mute",
+    "play_media": "choose what plays",
+    "select_source": "choose the source",
+    "lock": "lock",
+    "unlock": "unlock",
+    "open_cover": "open",
+    "close_cover": "close",
+}
+
+
+def device_name(entity_id):
+    """A readable name for a Home Assistant device id: "media_player.bedroom" -> "the
+    Bedroom media player"."""
+    domain, _, name = str(entity_id).partition(".")
+    if not name:
+        return str(entity_id)
+    kind = {
+        "media_player": "speaker",
+        "light": "light",
+        "lock": "lock",
+        "switch": "switch",
+        "cover": "cover",
+        "climate": "thermostat",
+        "fan": "fan",
+    }.get(domain, domain.replace("_", " "))
+    return "the " + name.replace("_", " ").title() + " " + kind
+
+
+def simple_access(access, catalog, zone="UTC"):
 
     from .permissions import short_label
     from .presentation import action_words, choices, constraint_text
@@ -167,20 +254,27 @@ def simple_access(access, catalog, zone="UTC"):
             if entry["name"] == "ha_get_state":
                 description = "Check the state"
             if actions:
-                aliases = (
-                    {
-                        "media_play": "play",
-                        "media_pause": "pause",
-                        "media_stop": "stop",
-                    }
-                    if ha_tool
-                    else {}
-                )
-                description = action_words([aliases.get(value, value) for value in actions])
+                aliases = HA_ACTION_WORDS if ha_tool else {}
+                spoken = [aliases.get(value, value) for value in actions]
+                if ha_tool and set(actions) <= {"turn_on", "turn_off", "toggle"}:
+                    spoken = [
+                        "turn " + " or ".join(w for w in ("on", "off") if "turn_" + w in actions)
+                    ]
+                description = action_words(spoken)
             if targets:
                 names = display.get("resource_labels", {})
-                connector = " of " if entry["name"] == "ha_get_state" else " on "
-                description += connector + ", ".join(names.get(value, value) for value in targets)
+                devices = ", ".join(
+                    names.get(value)
+                    or catalog.get(value, {}).get("name")
+                    or (device_name(value) if ha_tool else value)
+                    for value in targets
+                )
+                if ha_tool and actions:  # "Bedroom speaker: play, pause or stop"
+                    devices = devices.removeprefix("the ")
+                    description = devices[:1].upper() + devices[1:] + ": " + description
+                else:
+                    connector = " of " if entry["name"] == "ha_get_state" else " on "
+                    description += connector + devices
             elif entry["name"] == "ha_get_state" and option.get(resource) == {"any": True}:
                 description += " of any Home Assistant device or sensor"
             limits = [
@@ -193,18 +287,17 @@ def simple_access(access, catalog, zone="UTC"):
                     resource if targets else None,
                     action if actions else None,
                     display.get("namespace") if targets else None,
+                    "domain" if ha_tool and targets else None,  # implied by the device
                 }
                 and "any" not in rule
             ]
             if limits:
                 description += " (" + "; ".join(limits) + ")"
             lines.append("• " + description[:1].upper() + description[1:].rstrip(".") + ".")
-    if access.get("until_ended"):
-        end = "Access continues until the owner ends it."
-    else:
-        at = datetime.fromtimestamp(timestamp(access["expires_at"]), ZoneInfo(zone))
-        end = "Ends " + at.strftime("%a %d %b, %I:%M %p %Z").replace(", 0", ", ")
-    return "\n".join(dict.fromkeys(lines)) + "\n\n" + end
+    if access.get("guest_memory"):
+        # Signed into the grant, so the plain card says so too.
+        lines.append("• Private memory: preferences are remembered between chats.")
+    return "\n".join(dict.fromkeys(lines)) + "\n\n" + end_text(access, zone)
 
 
 def guest_view(label, access, catalog, zone="UTC", inviter=None, *, detailed=False):
@@ -219,9 +312,6 @@ def guest_view(label, access, catalog, zone="UTC", inviter=None, *, detailed=Fal
 
 
 def review(label, access, catalog, zone="UTC"):
-    from zoneinfo import ZoneInfo
-
-    end = datetime.fromtimestamp(timestamp(access["expires_at"]), ZoneInfo(zone))
     lines = [f"Access for {label}", ""]
     if access.get("chat_only"):
         lines += ["Chat only. No enabled actions or subagents."]
@@ -241,9 +331,7 @@ def review(label, access, catalog, zone="UTC"):
     if lines[-1] != "":
         lines.append("")
     lines += [
-        "No end date. Access continues until the owner ends it."
-        if access.get("until_ended")
-        else "Ends " + end.strftime("%a %d %b %Y, %H:%M:%S %Z (UTC%z)"),
+        end_text(access, zone),
         "",
         "Access details",
         "• Scope is limited to the capabilities and inputs above.",
