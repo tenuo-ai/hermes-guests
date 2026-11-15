@@ -48,7 +48,7 @@ You can manage sharing from your own chat.
 | What you want | Try saying |
 | --- | --- |
 | See current access | “Who has access?” |
-| Change permissions | “Let Alex control the porch light too.” |
+| Change permissions | “Let Alex add to the shopping list too.” |
 | Give more time | “Extend Alex's access until Sunday.” |
 | End access | “End Alex's access.” |
 | Check activity | “What did Alex do today? Show the times in my timezone.” |
@@ -88,9 +88,29 @@ conversations, memory, and access records locally in separate profiles.
 [Model setup](docs/setup-recovery.md#model-setup) ·
 [Security and limits](docs/advanced.md)
 
+## What it does on your machine
+
+- **Background work.** While the gateway runs, a maintenance task checks access every
+  minute: it renews the owner and no-end-date warrants, sends the notices before and
+  when access ends, and applies data retention.
+- **Separate guest processes.** Each guest turn runs a native Hermes agent in its own
+  process, in a separate Hermes profile created for that guest. Its tool calls go
+  through a server on `127.0.0.1` that checks the guest's warrant before anything runs.
+- **Your configuration.** When you press **Enable sharing**, Hermes Guests adds itself
+  to your Telegram tools if you chose them explicitly. Guest profiles are created and,
+  when you delete a guest's data, removed.
+- **Keys and records.** Signing keys, warrants, access records, receipts and activity
+  are stored in the plugin's own data folder. Signing happens on this machine; see the
+  [trust model](docs/authorization.md#trust-model-built-for-ease-of-use).
+- **Network.** Hermes Guests makes no network calls of its own beyond your model
+  provider, through Hermes, and Telegram. Shared tools reach whatever services they
+  already use. Nothing is reported anywhere.
+- **Credentials.** Model keys come from your Hermes profile, and a Codex sign-in is used
+  through Hermes without the plugin holding the token.
+
 ## Contribute
 
-Try the [sharing scenarios](docs/human-test.md),
+Try the [sharing scenarios](docs/scenarios.md),
 [report an issue](https://github.com/tenuo-ai/hermes-guests/issues), or read
 [CONTRIBUTING.md](CONTRIBUTING.md) to work on the code.
 

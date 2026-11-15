@@ -22,14 +22,9 @@ def pages(text, limit=3400):
 
 def deadline(value, zone):
     """Use the same local clock for approval, invitation and claim deadlines."""
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
+    from .model import when
 
-    from .model import timestamp
-
-    return datetime.fromtimestamp(timestamp(value), ZoneInfo(zone)).strftime(
-        "%a %d %b, %H:%M:%S %Z"
-    )
+    return when(value, zone)
 
 
 def heading_entities(text, *, first_page=True):

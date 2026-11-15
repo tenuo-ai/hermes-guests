@@ -232,7 +232,7 @@ def review_lines(entry):
     return lines
 
 
-TOOL_DESCRIPTION_LIMIT = 300  # how much of a tool's own description a review shows
+TOOL_DESCRIPTION_LIMIT = 3000  # the whole stored description: Details is the complete view
 
 
 def own_description(schema):

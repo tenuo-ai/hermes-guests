@@ -82,7 +82,7 @@ class PermissionCardTests(unittest.TestCase):
             self.assertIn(name + "\n• Turn off or turn on", text)
         for raw in ("Domain", "Permission group", "device_control", '"turn_on"'):
             self.assertNotIn(raw, text)
-        self.assertIn("Ends ", text)
+        self.assertIn("Lasts 1 hour from approval", text)
 
     def test_descriptions_survive_restart_renewal_and_permission_checks(self):
         sid = self.activate(device_selection())
@@ -293,13 +293,14 @@ class PermissionCardTests(unittest.TestCase):
                     self.assertNotIn("Tool:", card(own_words))
                 plain = {"name": "media_manage", "constraints": {"library": {"any": True}}}
                 self.assertIn("\nmedia manage\n", self.prepare([plain])["text"])
-        # A description that runs to paragraphs is cut at a word, and says that it was cut.
-        self.schemas["media_manage"]["description"] = "Manage a media library. " + "word " * 200
+        # Details is the complete view: a description that runs to paragraphs is shown whole.
+        self.schemas["media_manage"]["description"] = (
+            "Manage a media library. " + "word " * 200 + "Deletes every title."
+        )
         shown = next(
             line for line in card("Browse titles").split("\n") if line.startswith("  Tool: ")
         )
-        self.assertLessEqual(len(shown), 320)
-        self.assertTrue(shown.endswith("word…"), shown[-30:])
+        self.assertTrue(shown.endswith("Deletes every title"), shown[-30:])
 
     def test_unmentioned_limits_are_always_rendered(self):
         tools = device_selection()
