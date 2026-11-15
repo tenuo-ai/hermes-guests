@@ -2456,6 +2456,18 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Share with Alex", self.bot.sent[-1][1])
         self.assertFalse(self.service.never())
 
+    async def test_never_share_buttons_fit_a_phone(self):
+        long = "Call a Home Assistant service to control a device in the house"
+        self.plugin.shareable = lambda all_tools=False: {"web_search": long}
+        self.plugin.resolve_tool = GUEST_SCHEMAS.get
+        await self.ready_owner()
+        await self.click(100, await self.advanced("Never-share list"))
+        tool_buttons = [b for b in self.buttons(self.bot.sent[-1]) if b.startswith("☐ ")]
+        self.assertTrue(tool_buttons)
+        self.assertTrue(all(len(b) <= 2 + 26 for b in tool_buttons), tool_buttons)
+        await self.click(100, self.press("Block a word in one tool"))
+        self.assertTrue(all(len(b) <= 26 for b in self.buttons(self.bot.sent[-1])))
+
     async def test_chat_only_never_share_panel_can_render_many_words(self):
         self.plugin.shareable = lambda all_tools=False: {}
         await self.ready_owner()

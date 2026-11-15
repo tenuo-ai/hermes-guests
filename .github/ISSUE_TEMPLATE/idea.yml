@@ -1,0 +1,11 @@
+name: Improvement or idea
+description: Something you wanted to share or do with guests, or a step that could be easier.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What would you like to do?
+      description: For example "let my sister check the thermostat but not change it". What did you try?
+    validations:
+      required: true

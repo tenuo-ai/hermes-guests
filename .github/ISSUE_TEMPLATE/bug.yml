@@ -1,0 +1,24 @@
+name: Bug
+description: Something didn't work, or a message was confusing.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what happened instead. A screenshot helps.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      placeholder: "Hermes 0.23.1, Hermes Guests 0.1.0rc4"
+  - type: input
+    id: tool
+    attributes:
+      label: Tool or service involved
+      placeholder: "Home Assistant, an MCP server, chat only…"
+  - type: markdown
+    attributes:
+      value: Please leave out invitation links, tokens, personal names and chat history. Security problems go to security@tenuo.ai instead.
