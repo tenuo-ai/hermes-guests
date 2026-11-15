@@ -258,6 +258,12 @@ class NativeGuestRunner:
                 },
                 "tool_schemas": schemas,
                 "delegation": bool(delegation),
+                # Times the model can say in the reader's own clock, and when this access
+                # last changed, so refusals from before a renewal are not taken as current.
+                "zone": self.service.zone_of(record),
+                "zone_is_theirs": bool(record.get("guest_zone")),
+                "now": self.service.clock(),
+                "changed_at": record.get("changed_at") or record.get("updated_at"),
                 "guest_memory": bool(record["scope"].get("guest_memory")) and not delegation,
             }
             # API keys and turn tokens travel only through the worker pipe.
