@@ -1,5 +1,5 @@
 name: hermes-guests
-version: 0.1.0rc3
+version: 0.1.0rc4
 description: >-
   Share selected services with Telegram guests through native confirmations,
   isolated guest agents, and local Tenuo enforcement. Development preview.

@@ -22,7 +22,7 @@ PRESENTATION_SCHEMA = {
     "properties": {
         "operation": {
             **LABEL_SCHEMA,
-            "description": "Short description of the actual tool operation when it has no action input, for example Read state and details or Read calendar events. Interpret the discovered schema accurately.",
+            "description": "Short description of the actual tool operation, for example Turn on or off, Read state and details or Read calendar events. Cards show the resource first (Porch light — turn on or off), so don't repeat the resource here. Interpret the discovered schema accurately.",
         },
         "action": {
             "type": "string",
@@ -99,8 +99,8 @@ def normalize_presentation(value, entry):
     value = copy.deepcopy(value)
     if "operation" in value and not value["operation"].strip():
         raise GuestsError("Give the operation a readable name.")
-    if "operation" in value and ("action" in value or "resource" not in value):
-        raise GuestsError("Use operation with a resource and no action input.")
+    # Any tool can carry a plain explanation for the owner's card. It never replaces the
+    # rules: the action and resource values are shown from the rules themselves.
     if any(
         not label.strip()
         for group in ("labels", "resource_labels")
@@ -199,7 +199,8 @@ def review_lines(entry):
             named = [
                 names[v] + " (" + v + ")" if v in names and names[v] != v else v for v in resources
             ]
-            sentence = (action_words(actions) + " — " if actions else "") + joined(named, "and")
+            # The resource first, then what may be done to it.
+            sentence = joined(named, "and") + (" — " + action_words(actions) if actions else "")
             lines.append("• " + sentence[0].upper() + sentence[1:])
             covered.add(resource)
             if actions:
@@ -232,7 +233,7 @@ def review_lines(entry):
     return lines
 
 
-TOOL_DESCRIPTION_LIMIT = 300  # how much of a tool's own description a review shows
+TOOL_DESCRIPTION_LIMIT = 3000  # the whole stored description: Details is the complete view
 
 
 def own_description(schema):
@@ -241,6 +242,9 @@ def own_description(schema):
     text = " ".join(str(schema.get("description") or "").split()).rstrip(".")
     if len(text) > TOOL_DESCRIPTION_LIMIT:
         text = text[:TOOL_DESCRIPTION_LIMIT].rsplit(" ", 1)[0].rstrip(",;:.") + "…"
+    if len(str(schema.get("description") or "")) >= 3000:
+        # Stored descriptions stop at 3000 characters; say so rather than look complete.
+        text += " … [description cut at 3000 characters; check the tool before sharing it]"
     return text
 
 
@@ -272,12 +276,10 @@ def review_tools(entries):
                 key = (resource, value, label)
                 group = groups.setdefault(key, [heading])
                 group += ["• " + operation]
-                # A tool that describes itself in no words is shown by its name.
-                own = own_description(single["schema"]) or rendered[0]
-                said = operation.casefold().rstrip(".")
-                if said != own.casefold():
-                    # The opening sentence alone can omit an effect the owner needs to see.
-                    group += ["  Tool: " + own]
+                # The tool's real name and the opening of its own description. Descriptions
+                # written as model instructions run to paragraphs; the name is the check.
+                own = own_description(single["schema"]).split(". ", 1)[0].rstrip(".")
+                group += ["  Tool: " + str(single["name"]) + (" — " + own if own else "")]
                 group += rendered[2:]
     lines = []
     for group in groups.values():

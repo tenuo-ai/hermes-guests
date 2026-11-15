@@ -1,5 +1,7 @@
 """Small native Telegram presentation helpers; never truncate a permission review."""
 
+import re
+
 
 def pages(text, limit=3400):
     if not isinstance(text, str):
@@ -22,14 +24,12 @@ def pages(text, limit=3400):
 
 def deadline(value, zone):
     """Use the same local clock for approval, invitation and claim deadlines."""
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
+    from .model import when
 
-    from .model import timestamp
+    return when(value, zone)
 
-    return datetime.fromtimestamp(timestamp(value), ZoneInfo(zone)).strftime(
-        "%a %d %b, %H:%M:%S %Z"
-    )
+
+_DAY = re.compile(r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{1,2} [A-Z][a-z]{2} \d{4}$")
 
 
 def heading_entities(text, *, first_page=True):
@@ -37,9 +37,9 @@ def heading_entities(text, *, first_page=True):
     from telegram import MessageEntity
 
     headings = {
-        "Home Assistant",
-        "Web research",
-        "Connected tools",
+        "What they can do",
+        "When it ends",
+        "Good to know",
         "Allowed actions",
         "Access details",
     }
@@ -51,7 +51,8 @@ def heading_entities(text, *, first_page=True):
         if title and (
             (first_page and offset == 0)
             or title in headings
-            or title.startswith(("Permission group ", "Ends "))
+            or title.startswith("Permission group ")
+            or _DAY.match(title)
         ):
             result.append(MessageEntity(MessageEntity.BOLD, offset, length))
         offset += len(line.encode("utf-16-le")) // 2

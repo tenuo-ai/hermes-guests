@@ -21,10 +21,16 @@ class ActivityTests(unittest.TestCase):
                 "at": datetime(2026, 1, 1, 1, 2, 3, tzinfo=timezone.utc).timestamp(),
             }
         ]
-        self.assertIn("2025-12-31 20:02:03 EST", activity_text("Alex", rows, "EST"))
+        est = activity_text("Alex", rows, "EST")
+        self.assertIn("Wed 31 Dec 2025", est)
+        self.assertIn("8:02:03 PM", est)
+        self.assertIn("Times are EST.", est)
         rows[0]["at"] = datetime(2026, 7, 1, 16, tzinfo=timezone.utc).timestamp()
-        self.assertIn("2026-07-01 12:00:00 EDT", activity_text("Alex", rows, "America/Toronto"))
-        self.assertIn("2026-07-01 11:00:00 EST", activity_text("Alex", rows, "EST"))
+        toronto = activity_text("Alex", rows, "America/Toronto")
+        self.assertIn("Wed 1 Jul 2026", toronto)
+        self.assertIn("12:00:00 PM", toronto)
+        self.assertIn("Times are Toronto time.", toronto)
+        self.assertIn("11:00:00 AM", activity_text("Alex", rows, "EST"))
 
     def test_owner_lifecycle_actions_are_distinct_from_guest_service_completion(self):
         rows = [
@@ -38,8 +44,8 @@ class ActivityTests(unittest.TestCase):
             {"at": 1, "kind": "access_activated", "actor_label": "Owner", "subject_label": "Blair"},
         ]
         text = activity_text("everyone", rows, "UTC", lifecycle=True)
-        self.assertIn("Owner  Approved ending access — Alex", text)
-        self.assertIn("Owner  Access activated — Blair", text)
+        self.assertIn("Owner · Approved ending access — Alex", text)
+        self.assertIn("Owner · Access activated — Blair", text)
 
     def test_labels_remain_one_line_in_the_recorded_activity_view(self):
         rows = [
@@ -54,7 +60,8 @@ class ActivityTests(unittest.TestCase):
         text = activity_text("everyone", rows, "UTC", lifecycle=True)
         self.assertIn("Alex Owner", text)
         self.assertNotIn("\x00", text)
-        self.assertEqual(len(text.splitlines()), 3)
+        # Heading, day, the one entry and the time zone: the label added no lines.
+        self.assertEqual(len([line for line in text.splitlines() if "Owner" in line]), 1)
 
     def test_retained_reader_filters_owner_actor_and_keeps_existing_share_filter(self):
         with tempfile.TemporaryDirectory() as directory:

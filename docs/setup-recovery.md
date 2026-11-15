@@ -21,6 +21,11 @@ install Hermes Guests by itself in the environment used for sharing.
 If a source scan asks for review, inspect the reported files before confirming.
 Hermes Guests launches isolated guest workers; its tests contain Unicode permission labels.
 
+After updating Hermes Guests, send `/new` in your Telegram chat before your next
+sharing request. Hermes keeps an open chat's tool descriptions until a new session
+starts, so an old chat can describe the previous version. Hermes Guests reminds you
+once when its tools have changed.
+
 ## Model setup
 
 Use `hermes model` in the owner profile to select the model for guest turns.
@@ -133,43 +138,43 @@ reuse retained personalization. A new approved invitation after deletion starts
 with a fresh profile. Unrelated profiles and security/audit evidence remain.
 Actions already in progress may finish. Later calls and stale replies are stopped.
 
-[The human-test guide](human-test.md) covers setup, changes, renewal, restarts,
+[The sharing scenarios](scenarios.md) cover setup, changes, renewal, restarts,
 repair, and cleanup. Test identity recovery separately with disposable authority.
 Use [development testing](testing.md) for fixture and model checks. Record
 actual Telegram delivery and connected-service results separately.
 
-## Handoff windows
+## Settings
 
-Operators can set `review_seconds`, `invitation_seconds`, and `claim_seconds` under
-`plugins.entries.hermes-guests.settings` in the profile configuration. Values must be
-integers from 60 through 86400. Defaults preserve existing behavior at 600, 1800,
-and 600 seconds. These settings control approval, invitation claiming and owner
-confirmation of the claimant. The guest's approved end time remains independent.
-Invitation and claim deadlines are capped by that end time.
+Set these under `plugins.entries.hermes-guests.settings` in the profile configuration.
+
+| Setting | Default | Allowed | What it does |
+| --- | --- | --- | --- |
+| `review_seconds` | 600 | 60–86400 | How long an access review can be approved. |
+| `invitation_seconds` | 86400 | 60–2592000 | How long an invitation link works when access is a length of time. With a fixed end, the link works until access ends. |
+| `claim_seconds` | 86400 | 60–2592000 | How long you have to confirm the account that opened an invitation. |
+| `guest_names` | `yours` | `yours`, `telegram` | Keep the name you gave a guest, or switch to their Telegram name once they join. |
+| `activity_retention_days` | 90 | 1–3650 | How long readable activity is kept. |
+| `require_owner_warrant` | `false` | `true`, `false` | Fall back to Hermes, or block, when your own tool call isn't covered by your warrant. See [below](#using-the-hermes-tenuo-plugin-alongside-hermes-guests). |
+
+A length of access ("15 minutes", "a week") starts when you confirm the guest's
+account, so a late invitation costs nothing. A fixed end ("until Sunday 9 PM") never
+moves, and invitation and confirmation deadlines never pass it.
 
 The agent can use `guests_status` to distinguish pending or expired reviews from
 invitations awaiting a claim. A pending invitation does not appear as active guest
-access until the actual Telegram account is confirmed. An expired review requires
-a new reviewed proposal with the original scope and end time.
-
-Approval cards, invitation messages and claimant-confirmation cards show the
-stored deadline in the owner's local timezone. A refreshed invitation receives a
-new claiming window bounded by the approved access end time.
-
+access until the actual Telegram account is confirmed. An expired review needs a new
+review. Cards and invitation messages show deadlines in the reader's time zone.
 
 ## Choosing time to accept in chat
 
-An owner can say “Give Alex two days of access and a day to accept.” The proposal
-uses a per-invitation window of up to one day, independently of access duration.
-The native review shows that window. The invitation message shows its exact
-acceptance deadline. A replacement link reuses the reviewed window, capped by the
-original access end time. Existing guest updates preserve the guest's account and
-require no new invitation.
+You can say “Give Alex two days of access and a day to accept,” or “until Sunday 9 PM,
+and keep the invite open all weekend.” The review shows how long the invitation
+works, and the invitation message shows its exact deadline. A replacement link reuses
+that window, capped by a fixed end time. Changes to an existing guest's access need
+no new invitation.
 
-`guests_prepare_access.invitation_seconds` accepts 60 through 86400 seconds.
-Omitting it snapshots the profile's current `invitation_seconds` default into the
-new proposal. Review and actual-account confirmation windows remain operator
-settings. Existing saved proposals from earlier versions keep their prior behavior.
+`guests_prepare_access.invitation_seconds` accepts 60 through 2592000 seconds (30
+days). Without it, the profile's `invitation_seconds` default applies.
 
 ## Guest data
 
