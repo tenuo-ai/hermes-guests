@@ -66,7 +66,7 @@ class EndedAccessTests(unittest.TestCase):
         # Short invitation windows: upkeep clears the used invitation a little before the
         # review it came from.
         self.s = self.service(invitation_seconds=60, claim_seconds=60)
-        p = self.s.prepare("100", "Alex", self.scope(20 * 86400))
+        p = self.s.prepare("100", "Alex", self.scope(20 * 86400), invitation_seconds=60)
         invitation = self.s.approve("100", p["proposal_id"])
         claim = self.s.claim(invitation["token"], "200", "Alex R")
         sid = self.s.accept_claim("100", claim["claim_id"])["share_id"]
@@ -360,7 +360,7 @@ class EndedAccessTests(unittest.TestCase):
         self.assertEqual(signed_guest(self.s._warrant(record)), "200")
         self.assertEqual(self.effects, ["ha_get_state"])
 
-    def test_requests_for_more_time_are_limited_like_requests_for_more_access(self):
+    def test_requests_for_more_time_the_owner_lets_lapse_do_not_count(self):
         sid, _ = self.give()
         self.now += 2 * 3600  # it ran out
         first = self.s.renewal("200", sid)
@@ -378,11 +378,8 @@ class EndedAccessTests(unittest.TestCase):
                 self.s.renewal("200", sid)
                 asked += 1
             except GuestsError as refused:
-                self.assertIn("a few times today", str(refused))
-                break
-        self.assertEqual(asked, 3)
-        self.now += 86400
-        self.s.renewal("200", sid)  # and again the next day
+                self.fail(str(refused))
+        self.assertEqual(asked, 11)  # only requests the owner declines count
 
     def test_requests_for_more_time_are_counted_per_person_not_per_access(self):
         first, _ = self.give()
@@ -404,7 +401,7 @@ class EndedAccessTests(unittest.TestCase):
                 self.s.renewal("200", sid)
                 asked += 1
             except GuestsError as refused:
-                self.assertIn("asked a few times today", str(refused))
+                self.assertIn("said no a few times today", str(refused))
         self.assertEqual(asked, 3)
 
     def test_taking_back_an_old_request_for_more_time_leaves_a_newer_one_counted(self):
@@ -442,7 +439,7 @@ class EndedAccessTests(unittest.TestCase):
             answered = self.s.renewal("200", sid)
             self.s.deny("100", answered["proposal_id"])
             self.now += 400
-        with self.assertRaisesRegex(GuestsError, "asked a few times today"):
+        with self.assertRaisesRegex(GuestsError, "said no a few times today"):
             self.s.renewal("200", sid)
 
     def test_deleting_a_guests_data_also_removes_what_they_wrote_and_their_telegram_name(self):

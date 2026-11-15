@@ -5,6 +5,17 @@ profile-scoped plugin state. Hermes Guests stores its access ledger in `ctx.stat
 protected key, warrant, revocation, and receipt artifacts in its plugin data area.
 The model cannot read signing keys or approve its own proposals.
 
+## Trust model: built for ease of use
+
+Hermes Guests drafts each permission, signs it with keys kept on the same machine
+as Hermes, and asks you to approve it with a button. The model cannot read the keys
+or approve its own proposals, and every guest action is checked against the signed
+permission. But the machine running Hermes is also the one that issues
+permissions, so anyone who takes control of that machine could issue new ones.
+This is a deliberate tradeoff that keeps setup to a single button. If you need
+permissions set and signed outside Hermes, for example by your organization, this
+release does not support that yet.
+
 ## Confirmation
 
 The owner asks naturally. The agent discovers actual enabled tool schemas and
