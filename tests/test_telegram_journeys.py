@@ -14,8 +14,8 @@ from telegram import CallbackQuery, Chat, Message, Update, User
 from telegram.ext import Application, ExtBot, MessageHandler, filters
 
 from hermes_guests.core import GuestsService
-from hermes_guests.model import GuestsError, iso
-from hermes_guests.plugin import GuestsPlugin
+from hermes_guests.model import GuestsError, iso, timestamp
+from hermes_guests.plugin import MANAGEMENT_TOOLS, GuestsPlugin
 from hermes_guests.schemas import GUEST_SCHEMAS
 from hermes_guests.store import FileState
 
@@ -276,7 +276,7 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
         await self.click(100, "hs:a:" + token_hash(token)[:24])
         self.assertTrue(any("It expires" in text for _, text, _ in self.bot.sent))
         self.assertTrue(any("Confirm by" in text for _, text, _ in self.bot.sent))
-        self.assertEqual(self.bot.recorded_commands, ["help", "access", "renew", "new"])
+        self.assertEqual(self.bot.recorded_commands, ["help", "access", "renew", "new", "timezone"])
         self.plugin.runner.run = lambda *args: "Hello! What would you like to talk about?"
         await self.message(200, "Hello")
         self.assertIn("talk about", self.bot.sent[-1][1])
@@ -287,6 +287,7 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
     async def test_status_distinguishes_expired_claim_confirmation(self):
         import json
 
+        self.service.claim_seconds = 600  # an owner who chose a ten-minute confirmation window
         _, token = await self.invite()
         self.service.claim(token, "200", "Alex")
         now = time.time()
@@ -306,10 +307,11 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
             [[b.text for b in row] for row in card[2].inline_keyboard],
             [["Approve"], ["Change", "Cancel"], ["Preview as Alex", "Details"]],
         )
-        self.assertIn("At a glance", card[1])
+        # The simple card: what is decided, in plain words, one end time. Details on request.
+        self.assertTrue(card[1].startswith("Share with Alex?"))
         self.assertIn("Ends ", card[1])
         self.assertIn("Approve by ", card[1])
-        self.assertIn("Access details", card[1])
+        self.assertNotIn("Access details", card[1])
         await self.click(100, self.press("Details"))
         self.assertIn("Access details", self.bot.sent[-1][1])
 
@@ -321,7 +323,7 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
         await self.message(100, "What lights are on?")
         self.assertEqual(len(self.bot.sent), 1)
         await self.click(100, button.callback_data, message_id=1)
-        self.assertIn("Enable sharing", self.bot.sent[-1][1])
+        self.assertIn("Set up guest sharing?", self.bot.sent[-1][1])
         self.assertFalse(self.service.owner_ready())
         self.assertEqual(self.effects, [])
 
@@ -330,7 +332,7 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
         await self.message(100, "How's the weather?")
         await self.message(100, "Let Adrian control the guest room lights for a day.")
         self.assertEqual(self.fallback, [100])
-        self.assertIn("Enable sharing", self.bot.sent[-1][1])
+        self.assertIn("Set up guest sharing?", self.bot.sent[-1][1])
         self.assertFalse(self.service.owner_ready())
         self.assertEqual(self.service.ledger.snapshot()["proposals"], {})
 
@@ -377,11 +379,63 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(self.plugin.owner_boundary("ha_get_state"))
 
     async def test_conversational_guest_tool_opens_setup_before_creating_proposal(self):
-        with patch("hermes_guests.plugin.actor", return_value="100"):
+        with (
+            patch("hermes_guests.plugin.actor", return_value="100"),
+            patch("hermes_guests.plugin.SETUP_WAIT_SECONDS", 0.05),
+        ):
             result = json.loads(await self.plugin.tool("guests_prepare_access", {"person": "Alex"}))
         self.assertFalse(result["ok"])
+        self.assertIn("go ahead", result["error"])
         self.assertEqual(self.bot.sent[-1][2].inline_keyboard[0][0].text, "Enable sharing")
         self.assertEqual(self.service.ledger.snapshot()["proposals"], {})
+
+    async def test_a_first_request_carries_on_after_the_owner_enables_sharing(self):
+        await self.message(100, "Hello")  # the general setup note goes out once
+        self.assertEqual(self.bot.sent[-1][2].inline_keyboard[0][0].text, "Set up guest sharing")
+        deleted = []
+
+        async def delete_message(chat_id, message_id, **kw):
+            deleted.append(message_id)
+            return True
+
+        object.__setattr__(self.bot, "delete_message", delete_message)
+        with patch("hermes_guests.plugin.actor", return_value="100"):
+            asked = asyncio.create_task(
+                self.plugin.tool(
+                    "guests_prepare_access",
+                    {"person": "Alex", "scope": {"chat_only": True, "duration_seconds": 3600}},
+                )
+            )
+            for _ in range(200):
+                if any("Set up guest sharing?" in t for _, t, _ in self.bot.sent):
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(deleted, [1])  # the setup card replaces the general note
+            await self.click(100, self.press("Enable sharing"))
+            result = json.loads(await asyncio.wait_for(asked, 5))
+        self.assertEqual(
+            result.get("result", {}).get("status"), "awaiting_owner_confirmation", result
+        )
+        texts = [t for who, t, _ in self.bot.sent if who == 100]
+        self.assertTrue(any("Preparing what you asked for" in t for t in texts), texts)
+        self.assertTrue(any(t.startswith("Share with Alex?") for t in texts), texts)
+
+    async def test_without_sharing_tools_the_request_is_quoted_back_after_enable(self):
+        self.plugin.owner_tools = lambda **_: {"ha_get_state": "Read state"}
+        await self.message(100, "Let Adrian control the guest room lights for a day.")
+        self.assertEqual(len(self.bot.sent), 1)  # one setup card, nothing else
+        self.plugin.owner_tools = lambda **_: {  # Enable adds the sharing tools
+            "ha_get_state": "Read state",
+            **{name: name for name in MANAGEMENT_TOOLS},
+        }
+        await self.click(100, self.press("Enable sharing"))
+        self.assertTrue(
+            any(
+                "Say “go ahead” and I'll prepare “Let Adrian control the guest room lights" in t
+                for _, t, _ in self.bot.sent
+            ),
+            [t for _, t, _ in self.bot.sent],
+        )
 
     async def test_only_owner_private_turns_receive_guest_tool_guidance(self):
         with patch("hermes_guests.plugin.actor", return_value="100"):
@@ -416,12 +470,14 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
         self.assertTrue(result["ok"])
-        self.assertIn("within 24 hours after sending", self.bot.sent[-1][1])
+        self.assertIn(
+            "The invitation link works for 1 day after you approve.", self.bot.sent[-1][1]
+        )
         await self.message(100, "/guests")
-        restored = [text for _, text, _ in self.bot.sent if "Access for Alex" in text]
+        restored = [text for _, text, _ in self.bot.sent if "Share with Alex?" in text]
         self.assertEqual(len(restored), 2)
         for text in restored:
-            self.assertIn("within 24 hours after sending", text)
+            self.assertIn("The invitation link works for 1 day after you approve.", text)
         self.assertEqual(self.effects, [])
 
     async def test_owner_manage_button_cannot_be_used_by_guest(self):
@@ -433,7 +489,7 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
     async def test_owner_setup_and_normal_owner_routing(self):
         await self.message(100, "/guests_setup")
         card = self.bot.sent[-1]
-        self.assertIn("usual tools", card[1])
+        self.assertIn("doesn't change", card[1])
         await self.click(100, card[2].inline_keyboard[0][0].callback_data)
         self.assertTrue(self.service.owner_ready())
         await self.message(100, "Help me share a service")
@@ -466,12 +522,16 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.effects, [])
         self.assertEqual(self.bot.sent[-1][2].inline_keyboard[0][0].text, "Request renewal")
         await self.click(200, "hs:r:" + sid)
+        # The guest chooses how much more time to ask for.
+        self.assertIn("How much more time", self.bot.sent[-1][1])
+        await self.click(200, self.bot.sent[-1][2].inline_keyboard[0][0].callback_data)
         cards = [
             x
             for x in self.bot.sent
             if x[0] == 100 and x[2] and x[2].inline_keyboard[0][0].text == "Approve"
         ]
         self.assertIn("Porch light", cards[-1][1])
+        self.assertTrue(cards[-1][1].startswith("Alex asks for 1 hour more."))
         self.assertEqual(self.service.get_access("100", sid)["effective_status"], "expired")
         await self.click(100, cards[-1][2].inline_keyboard[0][0].callback_data)
         self.assertEqual(self.service.get_access("100", sid)["effective_status"], "active")
@@ -484,8 +544,9 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
         sid = await self.activate()
 
         async def undelivered(ask):
+            await ask()  # the guest is asked how much more time
             object.__setattr__(self.bot, "fail_once", True)  # the owner's card does not arrive
-            await ask()
+            await self.click(200, self.bot.sent[-1][2].inline_keyboard[0][0].callback_data)
             self.assertEqual(self.bot.sent[-1][0], 200)
             self.assertIn("could not reach the owner", self.bot.sent[-1][1])
             db = self.service.ledger.snapshot()
@@ -499,6 +560,7 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
         self.service.clock = lambda: time.time() + 7200
         await undelivered(lambda: self.click(200, "hs:r:" + sid))  # and after it has run out
         await self.click(200, "hs:r:" + sid)  # sent again straight away, and this time it arrives
+        await self.click(200, self.bot.sent[-1][2].inline_keyboard[0][0].callback_data)
         self.assertIn("with the owner", self.bot.sent[-1][1])
         cards = [x for x in self.bot.sent if x[0] == 100 and x[2] and "Approve" in self.buttons(x)]
         self.assertIn("Porch light", cards[-1][1])
@@ -548,7 +610,7 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.list_access("200"), [])
         await self.message(200, "/start guests_" + new)
         self.assertTrue(
-            any(who == 100 and "awaiting approval" in text for who, text, _ in self.bot.sent)
+            any(who == 100 and "opened your invitation" in text for who, text, _ in self.bot.sent)
         )
 
     async def test_failed_invitation_delivery_is_retryable_without_duplicate_authority(self):
@@ -598,7 +660,7 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
         await self.message(100, "/guests")
         self.assertTrue(
             any(
-                "awaiting approval" in text and "Porch light" in text
+                "opened your invitation" in text and "Porch light" in text
                 for _, text, _ in self.bot.sent
             )
         )
@@ -790,8 +852,21 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
     async def test_setup_explains_owner_warrant_behavior_before_confirmation(self):
         await self.message(100, "/guests_setup")
         text = self.bot.sent[-1][1]
-        self.assertIn("Your usual tools stay available", text)
-        self.assertIn("Setup creates a warrant for your reviewed tools", text)
+        self.assertIn("Your own use of Hermes doesn't change", text)
+        self.assertIn("hermes-tenuo", text)
+        self.assertNotIn("guests prepare access", text)
+        cleared = []
+
+        async def clear(*args, **kwargs):
+            cleared.append(1)
+            return True
+
+        object.__setattr__(self.bot, "edit_message_reply_markup", clear)
+        await self.click(100, self.press("Details"))
+        details = self.bot.sent[-1][1]
+        self.assertEqual(cleared, [])  # Enable sharing is still there to press
+        self.assertIn("Your tools stay available", details)
+        self.assertIn("Setup creates a Tenuo warrant for your reviewed tools", details)
         self.assertFalse(self.service.owner_ready())
         self.assertEqual(self.effects, [])
 
@@ -834,9 +909,9 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
         await self.click(100, self.press("Next"))
         await self.click(100, self.press("No end date"))
         review = self.bot.sent[-1]
-        self.assertIn("Access for Alex", review[1])
+        self.assertIn("Share with Alex?", review[1])
         self.assertIn("Access continues until the owner ends it", review[1])
-        self.assertIn("Check the state of any Home Assistant device or sensor", review[1])
+        self.assertIn("any entity id", review[1])  # every rule is on the card
         self.assertNotIn("Search", review[1])
         self.assertEqual(
             [b.text for row in review[2].inline_keyboard for b in row],
@@ -879,7 +954,7 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
         await self.message(300, "/access")
         self.assertEqual(  # no end date: nothing to renew
             [b.text for row in self.bot.sent[-1][2].inline_keyboard for b in row],
-            ["Request more access"],
+            ["Request more access", "See permissions"],
         )
         # A later request that names this person changes their access, not a second grant.
         self.assertEqual(self.plugin.existing_access("100", "blair"), record["id"])
@@ -1048,7 +1123,11 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("timestamp", decisions[0])
         self.assertIsInstance(decisions[0]["at"], float)
         card = self.bot.sent[-1][1]
-        self.assertIn("Activity for owner", card)
+        self.assertIn("Activity for you", card)
+        self.assertIn("Times are EST.", card)
+        self.assertIn("You: ha get state", card)  # the owner's inputs stay private
+        await self.click(100, self.press("Full log"))
+        card = self.bot.sent[-1][1]
         self.assertRegex(card, r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} EST")
         self.assertIn("ha_get_state", card)
         self.assertIn("no result recorded", card)
@@ -1099,7 +1178,7 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
             for selected in ([], {}, 42, "missing"):
                 reply = json.loads(await self.plugin.tool("guests_activity", {"scope": selected}))
                 self.assertFalse(reply["ok"])
-            for limit in (0, 101, True, "50"):
+            for limit in (0, 1001, True, "50"):
                 reply = json.loads(
                     await self.plugin.tool("guests_activity", {"scope": "all", "limit": limit})
                 )
@@ -1116,10 +1195,11 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
         await self.click(100, self.press("Activity"))
         seen = self.bot.sent[-1][1]
         self.assertIn("Activity for Alex", seen)
-        self.assertIn("light.porch", seen)
-        self.assertIn("done", seen)
-        self.assertIn("light.front_door", seen)
-        self.assertIn("refused", seen)
+        self.assertIn("Alex: ha get state (light.porch)", seen)
+        self.assertIn("1 action done", seen)
+        self.assertIn("tried to ha get state (light.front_door) — not allowed", seen)
+        await self.click(100, self.press("Full log"))
+        self.assertIn("light.front_door", self.bot.sent[-1][1])
         await self.click(100, self.press("End access"))
         self.assertIn("End all access for Alex?", self.bot.sent[-1][1])
         self.assertEqual(self.service.guest("200")["effective_status"], "active")
@@ -1348,7 +1428,7 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
         await self.click(100, self.press("Search the web"))
         await self.click(100, self.press("Next: review"))
         review = self.bot.sent[-1]
-        self.assertIn("Access for Alex", review[1])
+        self.assertIn("Change Alex's access?", review[1])
         self.assertIn("Search the public web", review[1])
         self.assertEqual(
             self.service.guest("200")["scope"], before
@@ -1379,7 +1459,7 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("did not change your access", self.bot.sent[-1][1])
         await self.click(200, self.press("Request more access"))
         await self.message(200, "one more")
-        self.assertIn("asked a few times today", self.bot.sent[-1][1])
+        self.assertIn("said no a few times today", self.bot.sent[-1][1])
         owner_cards = [m for m in self.bot.sent if m[0] == 100 and "asks for more access" in m[1]]
         self.assertEqual(len(owner_cards), 3)
         await self.click(300, "hs:q:" + sid)  # Alex's own button, pressed by someone else
@@ -1404,7 +1484,7 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
             await self.message(200, f"Request access to thing {attempt}")
         await self.click(100, self.press("Not now"))
         await self.message(200, "Request access to one more thing")
-        self.assertIn("asked a few times today", self.bot.sent[-1][1])
+        self.assertIn("said no a few times today", self.bot.sent[-1][1])
         self.assertEqual(len(self.request_cards()), 3)
         self.assertEqual(len(self.runs), runs)  # none of it reached the guest's model
         self.assertEqual(self.errors, [])
@@ -1507,7 +1587,7 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.guest("200")["more_open"]["words"], "request B")
         self.assertEqual(self.service.guest("200")["id"], sid)
 
-    async def test_a_change_to_access_neither_answers_a_request_nor_resets_the_allowance(self):
+    async def test_an_approved_change_answers_an_open_request(self):
         sid = await self.activate()
         await self.ask("more please")
         p = self.service.prepare("100", "Alex", self.scope(), share_id=sid)
@@ -1515,7 +1595,7 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
         record = self.service.guest("200")
         self.assertEqual(record["revision"], 2)
         self.assertEqual(len(record["more_asked"]), 1)
-        self.assertEqual(record["more_open"]["words"], "more please")
+        self.assertFalse(record.get("more_open"))
 
     async def test_a_request_the_owner_could_not_be_told_about_is_taken_back(self):
         await self.activate()
@@ -1629,7 +1709,7 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
             "schema": {"description": "Turn a light on or off."},
         }
         self.assertIn(
-            "• Turn a light on or off.",
+            "• Turn a light on or off (any light).",
             simple_access({"tools": [open_tool], "until_ended": True}, {}),
         )
         self.assertIn(
@@ -1837,7 +1917,7 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
         await self.message(100, "/guests")
         await self.click(100, self.press("Manage access"))
         await self.click(100, self.press("Activity"))
-        self.assertIn("refused (your never-share list)", self.bot.sent[-1][1])
+        self.assertIn("— your never-share list", self.bot.sent[-1][1])
         await self.plugin.proposal_card(
             {
                 "proposal_id": self.service.prepare("100", "Blair", self.scope_without_lights())[
@@ -2069,7 +2149,11 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
         await self.click(100, self.press("Approve"))
         self.assertTrue(self.service.guest("200")["scope"].get("chat_only"))
         longer = self.plugin.keep_current("100", sid, {"duration_seconds": 7200})
-        self.assertEqual(longer, {"chat_only": True, "duration_seconds": 7200})
+        current_memory = bool(self.service.guest("200")["scope"].get("guest_memory"))
+        self.assertEqual(
+            longer,
+            {"chat_only": True, "duration_seconds": 7200, "guest_memory": current_memory},
+        )
         self.service.prepare("100", "Alex", longer, share_id=sid)  # accepted as it stands
         switch = {"chat_only": True, "duration_seconds": 60}
         self.assertEqual(self.plugin.keep_current("100", sid, dict(switch)), switch)
@@ -2313,6 +2397,275 @@ class TelegramJourneyTests(unittest.IsolatedAsyncioTestCase):
             delta=2,
         )
         self.assertEqual(self.service.get_access("100", sid)["status"], "revoked")
+
+    async def test_owner_is_told_once_to_start_a_new_chat_after_the_tools_change(self):
+        self.plugin.owner_tool_specs = [{"name": "guests_prepare_access", "description": "v1"}]
+        await self.ready_owner()  # setup records the version it set up
+        sent = len(self.bot.sent)
+        await self.plugin.tools_changed_notice()
+        self.assertEqual(len(self.bot.sent), sent)  # nothing to say right after setup
+        self.plugin.owner_tool_specs = [{"name": "guests_prepare_access", "description": "v2"}]
+        await self.plugin.tools_changed_notice()
+        await self.plugin.tools_changed_notice()
+        self.assertEqual(len(self.bot.sent), sent + 1)
+        self.assertEqual(self.bot.sent[-1][0], 100)
+        self.assertIn("/new", self.bot.sent[-1][1])
+
+    async def test_a_setup_from_before_the_reminder_is_told_and_a_failed_send_is_retried(self):
+        await self.ready_owner()
+        self.plugin.ctx.state.set("owner_tools_seen", None)  # set up by an older version
+        self.plugin.owner_tool_specs = [{"name": "guests_prepare_access", "description": "v2"}]
+        object.__setattr__(self.bot, "fail_once", True)
+        with self.assertRaises(Exception):
+            await self.plugin.tools_changed_notice()
+        await self.plugin.tools_changed_notice()
+        self.assertIn("/new", self.bot.sent[-1][1])
+
+    async def test_the_claim_card_uses_the_owners_name_and_shows_the_account(self):
+        await self.activate()
+        card = next(
+            t for who, t, _ in self.bot.sent if who == 100 and "opened your invitation" in t
+        )
+        self.assertTrue(card.startswith("Someone opened your invitation for Alex."), card)
+        self.assertIn("Telegram account: ", card)
+        self.assertIn("Accept if this is Alex.", card)
+
+    async def test_owner_adds_time_from_the_current_end_in_chat(self):
+        await self.ready_owner()
+        sid = await self.activate()
+        end = timestamp(self.service.get_access("100", sid)["scope"]["expires_at"])
+        with patch("hermes_guests.plugin.actor", return_value="100"):
+            result = json.loads(
+                await self.plugin.tool(
+                    "guests_prepare_access", {"person": "Alex", "add_seconds": 3600}
+                )
+            )
+        self.assertEqual(result["result"]["status"], "awaiting_owner_confirmation", result)
+        pending = [
+            p
+            for p in self.service.ledger.snapshot()["proposals"].values()
+            if p["status"] == "pending"
+        ]
+        self.assertEqual(timestamp(pending[-1]["scope"]["expires_at"]), end + 3600)
+        self.assertTrue(
+            any("Give Alex 1 hour more?" in t for who, t, _ in self.bot.sent if who == 100),
+            [t for _, t, _ in self.bot.sent[-3:]],
+        )
+
+    async def test_asking_for_more_while_access_is_on_adds_to_the_end(self):
+        await self.activate()
+        await self.message(200, "/renew")
+        self.assertIn("added to your current end time", self.bot.sent[-1][1])
+
+    async def test_guest_access_card_is_plain_with_details_a_tap_away(self):
+        await self.activate()
+        await self.message(200, "/access")
+        card = self.bot.sent[-1][1]
+        self.assertTrue(card.startswith("Your access"), card)
+        self.assertIn("Porch light", card)
+        self.assertNotIn("Entity id", card)
+        self.assertNotIn("Status:", card)
+        await self.click(200, self.press("See permissions"))
+        self.assertIn("Access for Alex", self.bot.sent[-1][1])
+
+    async def test_a_length_out_of_range_can_be_corrected_in_the_same_prompt(self):
+        await self.activate()
+        await self.message(200, "/renew")
+        await self.message(200, "31 days")
+        self.assertIn("between a minute and 30 days", self.bot.sent[-1][1])
+        await self.message(200, "6 hours")
+        self.assertIn("6 hours more is with the owner", self.bot.sent[-1][1])
+
+    async def test_cancel_closes_both_open_prompts(self):
+        await self.activate()
+        await self.message(200, "/access")
+        await self.click(200, self.press("Request more access"))
+        await self.message(200, "/renew")
+        await self.message(200, "/cancel")
+        runs = len(self.runs)
+        await self.message(200, "6 hours")
+        self.assertEqual(len(self.runs), runs + 1)  # an ordinary message, not a request
+        self.assertFalse(
+            any(p.get("renewal") for p in self.service.ledger.snapshot()["proposals"].values())
+        )
+
+    async def test_the_newest_prompt_gets_the_answer(self):
+        await self.activate()
+        await self.message(200, "/access")
+        await self.click(200, self.press("Request more access"))
+        await self.message(200, "/renew")
+        await self.message(200, "6 hours")
+        self.assertIn("6 hours more is with the owner", self.bot.sent[-1][1])
+        self.assertEqual(self.request_cards(), [])  # not sent as a request for more access
+
+    async def test_asking_for_more_access_after_renew_answers_that_question(self):
+        await self.activate()
+        await self.message(200, "/renew")
+        await self.message(200, "/access")
+        await self.click(200, self.press("Request more access"))
+        await self.message(200, "the kitchen light too")
+        await self.message(200, "6 hours")  # an ordinary message now, not a length
+        self.assertFalse(
+            any(p.get("renewal") for p in self.service.ledger.snapshot()["proposals"].values())
+        )
+
+    async def test_more_time_offers_only_lengths_that_fit(self):
+        sid = await self.activate()
+        with self.service.ledger.transaction() as db:
+            db["shares"][sid]["duration_seconds"] = 20 * 86400
+            db["shares"][sid]["scope"]["expires_at"] = iso(time.time() + 20 * 86400)
+        await self.message(200, "/renew")
+        labels = [b.text for row in self.bot.sent[-1][2].inline_keyboard for b in row]
+        self.assertNotIn("Same again (20 days)", labels)
+        self.assertIn("1 day", labels)
+
+    async def test_a_short_typed_length_is_still_possible_near_the_limit(self):
+        sid = await self.activate()
+        with self.service.ledger.transaction() as db:
+            db["shares"][sid]["duration_seconds"] = 30 * 86400
+            db["shares"][sid]["scope"]["expires_at"] = iso(time.time() + 30 * 86400 - 1800)
+        await self.message(200, "/renew")
+        self.assertIn("How much more time", self.bot.sent[-1][1])
+        self.assertIsNone(self.bot.sent[-1][2])  # no preset fits; a typed length still can
+
+    async def test_adding_time_and_an_end_time_together_is_refused(self):
+        await self.ready_owner()
+        sid = await self.activate()
+        with patch("hermes_guests.plugin.actor", return_value="100"):
+            result = json.loads(
+                await self.plugin.tool(
+                    "guests_prepare_access",
+                    {
+                        "person": "Alex",
+                        "share_id": sid,
+                        "add_seconds": 3600,
+                        "scope": {"expires_at": iso(time.time() + 7200)},
+                    },
+                )
+            )
+        self.assertFalse(result["ok"])
+        self.assertIn("not both", result["error"])
+
+    async def test_a_request_answered_with_setup_reaches_the_assistant_after_enable(self):
+        self.plugin.owner_tools = lambda **_: {"ha_get_state": "Read state"}
+        await self.message(100, "Let Adrian control the guest room lights for a day.")
+        self.plugin.owner_tools = lambda **_: {
+            "ha_get_state": "Read state",
+            **{name: name for name in MANAGEMENT_TOOLS},
+        }
+        await self.click(100, self.press("Enable sharing"))
+        with patch("hermes_guests.plugin.actor", return_value="100"):
+            context = self.plugin.owner_turn_context(platform="telegram")["context"]
+            again = self.plugin.owner_turn_context(platform="telegram")["context"]
+        self.assertIn("Let Adrian control the guest room lights for a day.", context)
+        self.assertNotIn("Adrian", again)  # handed over once
+
+    async def test_a_worded_request_closes_the_time_prompt(self):
+        await self.activate()
+        await self.message(200, "/renew")
+        await self.message(200, "Request access to the kitchen speaker too")
+        await self.message(200, "6 hours")  # an ordinary message, not a length
+        self.assertFalse(
+            any(p.get("renewal") for p in self.service.ledger.snapshot()["proposals"].values())
+        )
+
+    async def test_a_late_length_is_not_sent_and_says_so(self):
+        await self.activate()
+        await self.message(200, "/renew")
+        share, _ = self.plugin._asking_time["200"]
+        self.plugin._asking_time["200"] = (share, time.time() - 1)  # ten minutes passed
+        runs = len(self.runs)
+        await self.message(200, "6 hours")
+        self.assertIn("took longer than ten minutes", self.bot.sent[-1][1])
+        self.assertEqual(len(self.runs), runs)
+
+    async def test_requests_made_together_wait_on_one_setup_card(self):
+        with patch("hermes_guests.plugin.actor", return_value="100"):
+            first = asyncio.create_task(self.plugin.tool("guests_discover", {}))
+            second = asyncio.create_task(self.plugin.tool("guests_discover", {}))
+            for _ in range(200):
+                if any("Set up guest sharing?" in t for _, t, _ in self.bot.sent):
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.1)
+            cards = [t for _, t, _ in self.bot.sent if "Set up guest sharing?" in t]
+            self.assertEqual(len(cards), 1)
+            await self.click(100, self.press("Enable sharing"))
+            results = await asyncio.wait_for(asyncio.gather(first, second), 5)
+        self.assertTrue(all(json.loads(r).get("ok", True) is not False for r in results), results)
+
+    async def test_a_guest_sets_their_time_zone_with_a_command(self):
+        sid = await self.activate()
+        await self.message(200, "/timezone Vancouver")
+        self.assertIn("Vancouver time", self.bot.sent[-1][1])
+        self.assertEqual(
+            self.service.zone_of(self.service.get_access("100", sid)), "America/Vancouver"
+        )
+        await self.message(200, "/timezone Narnia")
+        self.assertIn("your city or time zone", self.bot.sent[-1][1])
+
+    async def test_adding_time_never_switches_on_private_memory(self):
+        await self.ready_owner()
+        sid = await self.activate()
+        with self.service.ledger.transaction() as db:
+            db["shares"][sid]["scope"]["guest_memory"] = False
+        with patch("hermes_guests.plugin.actor", return_value="100"):
+            await self.plugin.tool("guests_prepare_access", {"person": "Alex", "add_seconds": 3600})
+        pending = [
+            p
+            for p in self.service.ledger.snapshot()["proposals"].values()
+            if p["status"] == "pending"
+        ]
+        self.assertFalse(pending[-1]["scope"].get("guest_memory"))
+
+    async def test_a_waiting_request_carries_on_even_if_the_ready_message_fails(self):
+        with patch("hermes_guests.plugin.actor", return_value="100"):
+            asked = asyncio.create_task(self.plugin.tool("guests_discover", {}))
+            for _ in range(200):
+                if any("Set up guest sharing?" in t for _, t, _ in self.bot.sent):
+                    break
+                await asyncio.sleep(0.01)
+
+            async def fail(*args, **kwargs):
+                raise RuntimeError("Telegram is down")
+
+            self.plugin._ready_message = fail
+            await self.click(100, self.press("Enable sharing"))
+            result = await asyncio.wait_for(asked, 5)
+        self.assertTrue(self.service.owner_ready())
+        self.assertNotIn("isn't set up", result)
+
+    async def test_renew_works_after_access_runs_out(self):
+        sid = await self.activate()
+        with self.service.ledger.transaction() as db:
+            db["shares"][sid]["scope"]["expires_at"] = iso(time.time() - 60)
+        await self.message(200, "/renew")
+        self.assertIn("How much more time", self.bot.sent[-1][1])
+        self.assertIn("Time starts when the owner approves", self.bot.sent[-1][1])
+
+    async def test_activity_ranges_are_checked(self):
+        await self.ready_owner()
+        with patch("hermes_guests.plugin.actor", return_value="100"):
+            for bad in (0, -5, "yesterday", True):
+                result = json.loads(
+                    await self.plugin.tool("guests_activity", {"scope": "all", "since_hours": bad})
+                )
+                self.assertFalse(result["ok"], bad)
+
+    async def test_notices_still_go_out_when_maintenance_fails(self):
+        await self.ready_owner()
+        calls = []
+
+        async def notices():
+            calls.append(1)
+            raise asyncio.CancelledError  # stop the loop after one pass
+
+        self.plugin.configured_before = lambda: True
+        self.service.maintenance = lambda *a: (_ for _ in ()).throw(OSError("damaged profile"))
+        self.plugin.expiry_notices = notices
+        with self.assertRaises(asyncio.CancelledError):
+            await self.plugin.housekeeping()
+        self.assertEqual(calls, [1])
 
     async def test_activity_for_everyone_is_a_button_on_the_hub(self):
         await self.activate()

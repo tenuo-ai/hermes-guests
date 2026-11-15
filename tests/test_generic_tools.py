@@ -85,22 +85,24 @@ class GenericToolTests(unittest.TestCase):
         c = self.service.claim(inv["token"], "200", "Alex")
         return self.service.accept_claim("100", c["claim_id"])["share_id"]
 
-    def test_relative_duration_is_frozen_before_owner_confirmation(self):
+    def test_relative_duration_starts_when_the_owner_confirms(self):
+        # "Twenty minutes" means twenty minutes of use: the time starts when the grant is
+        # signed, not when the review was prepared.
         self.service.clock = lambda: 1800000000
         p = self.service.prepare(
             "100", "Alex", {"tools": self.selection(), "duration_seconds": 1200}
         )
         proposal = self.service.ledger.snapshot()["proposals"][p["proposal_id"]]
         self.assertEqual(proposal["scope"]["expires_at"], iso(1800001200))
-        self.assertNotIn("duration_seconds", proposal["scope"])
+        self.assertEqual(proposal["scope"]["duration_seconds"], 1200)
         self.service.clock = lambda: 1800000060
         inv = self.service.approve("100", p["proposal_id"])
         claim = self.service.claim(inv["token"], "200", "Alex")
         result = self.service.accept_claim("100", claim["claim_id"])
-        self.assertEqual(
-            self.service.get_access("100", result["share_id"])["scope"]["expires_at"],
-            iso(1800001200),
-        )
+        record = self.service.get_access("100", result["share_id"])
+        self.assertEqual(record["scope"]["expires_at"], iso(1800001260))
+        self.assertNotIn("duration_seconds", record["scope"])  # the signed grant has an end
+        self.assertEqual(record["duration_seconds"], 1200)  # kept to offer the same again
         for extra in (
             {"duration_seconds": True},
             {"duration_seconds": 0},
