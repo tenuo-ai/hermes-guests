@@ -168,6 +168,14 @@ class ShareMenuTests(unittest.TestCase):
         porch = top[0]["children"][0]
         self.assertEqual(len(porch["children"]), 13)  # Check it and all twelve; paged on screen
 
+    def test_a_device_name_says_what_it_is(self):
+        self.assertEqual(
+            menu.say_what_it_is("Eilish", "media_player", "Bedroom"),
+            "Eilish (bedroom media player)",
+        )
+        self.assertEqual(menu.say_what_it_is("Porch light", "light", "Outside"), "Porch light")
+        self.assertEqual(menu.say_what_it_is("Kitchen", "light", "Kitchen"), "Kitchen (light)")
+
     def test_an_enum_is_used_without_a_model(self):
         schema = {
             "name": "calendar_read",

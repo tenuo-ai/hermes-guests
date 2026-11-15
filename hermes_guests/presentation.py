@@ -46,7 +46,7 @@ PRESENTATION_SCHEMA = {
             "type": "object",
             "maxProperties": 100,
             "additionalProperties": LABEL_SCHEMA,
-            "description": "Map exact selected resource IDs to names verified through discovery. The card also displays each canonical ID.",
+            "description": "Map exact selected resource IDs to names verified through discovery, as a guest would recognise them. When a name doesn't say what the thing is (a speaker named after a person), add it: Eilish (bedroom speaker). The card also displays each canonical ID.",
         },
     },
     "description": "Identify action/resource input fields and readable labels. Hermes Guests renders their actual constraints. A namespace may be omitted from the card only when its exact value is already present in every displayed resource ID.",

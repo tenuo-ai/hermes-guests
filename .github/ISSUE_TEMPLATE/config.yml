@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security problem
+    url: https://github.com/tenuo-ai/hermes-guests/blob/main/SECURITY.md
+    about: Please report security problems privately.
+  - name: General Hermes-Tenuo authorization
+    url: https://github.com/tenuo-ai/hermes-tenuo/issues
+    about: Ideas about authorizing Hermes tool calls beyond guest sharing.

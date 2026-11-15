@@ -27,6 +27,17 @@ Read [README.md](README.md), [CONTRIBUTING.md](CONTRIBUTING.md),
 - Plain cards stay in plain words: the assistant's explanation and resource names, with
   ids, raw rule values and tools' official descriptions under Details.
 
+## Review guidelines
+
+For automated reviewers (Codex, Copilot). Usability comes first, with documented
+trade-offs. Report as P0/P1 only: a guest getting access the owner didn't approve, a
+refused call reaching a tool, one person seeing another's data, lost or corrupted
+saved access, keys or end times, crashes and wrong results. Don't report wording,
+layout or card content, new limits or confirmations that make sharing harder,
+documented trade-offs such as local signing, or cases needing several unlikely
+conditions together; at most mention them as low-priority suggestions. Give each
+finding a concrete failing case and a small fix.
+
 ## Preserve the trust boundary
 
 - The model proposes permissions. Trusted code validates them, renders the complete

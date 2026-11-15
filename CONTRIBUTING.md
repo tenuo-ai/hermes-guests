@@ -1,56 +1,37 @@
 # Contributing to Hermes Guests
 
-You can help by trying your first guest invitation and telling us where you
-got stuck. Clearer wording, a small reproduction, and fixes for a tool you
-actually use are welcome contributions.
+Thanks for trying Hermes Guests. Any of these helps:
 
-## Report a problem
+- **Bugs:** something didn't work, or a card or message was confusing.
+- **Improvements and ideas:** something you wanted to share with a guest but
+  couldn't, or a step that took longer than it should.
+- **Pull requests:** fixes, wording, docs, or support for a tool you use.
 
-[Open an issue](https://github.com/tenuo-ai/hermes-guests/issues) with what you
-tried, what you expected and what happened. Include your Hermes and Hermes Guests versions,
-the connected tool involved, and a redacted screenshot or small reproduction
-when helpful. Keep tokens, invitation links, personal identifiers and private chat
-history out of reports. Use the [security reporting instructions](SECURITY.md) for sensitive findings.
+[Open an issue](https://github.com/tenuo-ai/hermes-guests/issues/new/choose) or send a
+pull request. We reply within a week.
 
-For a larger change, discuss the user problem in an issue before building it.
+Ideas about how Hermes tool calls are authorized in general, beyond sharing with
+guests, belong in [Hermes-Tenuo](https://github.com/tenuo-ai/hermes-tenuo).
 
-## Set up for development
+## Pull requests
 
-Use a working Hermes checkout and its Python environment. Clone this repository,
-then install the editable package and test dependencies from its root.
+Keep a pull request to one change and say what it improves for owners or guests. CI
+runs the full test suite on every pull request, so you don't need to run it all
+yourself. To check locally, from this repository in your Hermes environment:
 
 ```sh
 python -m pip install -e '.[test]'
-python scripts/check.py
+python scripts/run_tests.py --fast
 ```
 
-The check runs lint, formatting, the test suite, guard compatibility probes and a
-wheel build. Native-agent tests need Hermes's source modules available to the same
-Python interpreter. See [development testing](docs/testing.md) for setup details,
-individual commands and optional model evaluations.
+If your change affects what a guest may do, include a test showing that a refused
+call never reaches the tool. We'll help with this in review.
+[More on testing](docs/testing.md)
 
-Automated tests use disposable Hermes homes, recording Telegram transport and
-synthetic services. Human testing starts with the README and
-[sharing scenarios](docs/scenarios.md). Use consenting participants and services
-you're authorized to test.
+## Keep private things out
 
-To try the README install and first guest invitation locally, run
-`bash scripts/test-install.sh /path/to/hermes-agent`. The
-[install smoke test guide](docs/testing.md#test-the-readme-install) explains
-the fixtures and how to exercise Home Assistant.
+Leave invitation links, tokens, personal names and chat history out of issues,
+screenshots and tests. Report security problems privately as described in
+[SECURITY.md](SECURITY.md).
 
-## Send a pull request
-
-Keep the change focused and explain the user-facing behavior it improves. Add a
-regression test for a fix or changed behavior, update affected documentation and
-run the checks above. Report what passed, what you skipped and why.
-
-Permission changes need negative tests proving that denied operations never reach
-the protected handler. Preserve existing saved access and end times. The full
-review and enforcement must use the same normalized permissions.
-[Authorization details](docs/authorization.md)
-
-Use synthetic names and resources in examples. Keep runtime state, credentials,
-private keys and personal conversations out of commits and test output.
-
-Contributions are provided under the project's [Apache-2.0 license](LICENSE).
+Contributions are provided under the [Apache-2.0 license](LICENSE).

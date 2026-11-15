@@ -1209,7 +1209,8 @@ class GuestsPlugin:
                 "unclear, or matches no tool, return an empty tools "
                 "list. Each tool entry has constraints (per input: equals, one_of, range, or "
                 "any) and presentation with operation (a few plain words for the owner), "
-                "resource and resource_labels."
+                "resource and resource_labels (names a guest would recognise; add what the "
+                "thing is when its name doesn't say, like Eilish (bedroom speaker))."
             ),
             input=[{"type": "text", "text": json.dumps(payload)}],
             json_schema=schema,
@@ -1270,10 +1271,12 @@ class GuestsPlugin:
             + ["• word, everywhere: " + v for v in never.values]
             + ["• word, in " + where(r) + " only: " + r["value"] for r in never.scoped]
         )
+        short = await self.button_labels(names)
+        self.never_tools["labels"] = short
         rows = [
             [
                 (
-                    ("🚫 " if never.blocks_tool(name) else "☐ ") + clip(tools.get(name, name), 34),
+                    ("🚫 " if never.blocks_tool(name) else "☐ ") + short[name],
                     f"hs:k:{token}:t{i}",
                 )
             ]
@@ -1330,7 +1333,12 @@ class GuestsPlugin:
                 who,
                 "Block a word in which tool?",
                 [
-                    [(clip(tools.get(n, n), 34), f"hs:k:{token}:p{i}")]
+                    [
+                        (
+                            (card.get("labels") or {}).get(n) or clip(tools.get(n, n), 26),
+                            f"hs:k:{token}:p{i}",
+                        )
+                    ]
                     for i, n in enumerate(card["names"])
                 ],
             )
@@ -1605,6 +1613,32 @@ class GuestsPlugin:
                 )
         return tree + lazy
 
+    async def button_labels(self, names):
+        """Labels that fit a phone button for these tools ({name: label}), the same way as
+        the sharing menu: the model's few words, else the list's own words when short,
+        else the tool's description cut at a word."""
+        tools, listed = {}, self.shareable(all_tools=True)
+        for name in names:
+            try:
+                tools[name] = validate_schema(self.resolve_tool(name))
+            except Exception:
+                continue
+        _, short = await self.model_shapes(tools)
+        out = {}
+        for name in names:
+            own = listed.get(name, name)
+            out[name] = (
+                short.get(name)
+                or (own if len(own) <= menu.BUTTON else None)
+                or (
+                    short_label(tools[name].get("description"), name, menu.BUTTON)
+                    if name in tools
+                    else None
+                )
+                or clip(own, menu.BUTTON)
+            )
+        return out
+
     def toolset_of(self, name):
         """The Hermes toolset a tool belongs to, which names its integration."""
         try:
@@ -1626,11 +1660,14 @@ class GuestsPlugin:
                 eid = str(entity.get("entity_id", ""))
                 attributes = entity.get("attributes", {}) or {}
                 if "." in eid:
-                    entities[eid] = (
+                    name = str(
                         entity.get("friendly_name")
                         or entity.get("name")
                         or attributes.get("friendly_name")
                         or eid
+                    )
+                    entities[eid] = menu.say_what_it_is(
+                        name, eid.split(".", 1)[0], entity.get("area") or attributes.get("area")
                     )
             services = {}
             if "ha_call_service" in tools:
@@ -1651,8 +1688,8 @@ class GuestsPlugin:
         if not tools or llm is None or not hasattr(llm, "acomplete_structured"):
             return {}, {}
         fingerprint = json.dumps(sorted((n, digest(t)) for n, t in tools.items()))
-        cache = getattr(self, "_shapes", None) or {}
-        if cache.get("fingerprint") == fingerprint:
+        cache = (getattr(self, "_shapes", None) or {}).get(fingerprint)
+        if cache:
             return cache["shapes"], cache["labels"]
         payload = [
             {
@@ -1694,7 +1731,9 @@ class GuestsPlugin:
             if isinstance(item, dict) and item.get("name") in tools:
                 if label := menu.check_label(item.get("label")):
                     labels[item["name"]] = label
-        self._shapes = {"fingerprint": fingerprint, "shapes": shapes, "labels": labels}
+        self._shapes = getattr(self, "_shapes", None) or {}
+        self._shapes = dict(list(self._shapes.items())[-3:])  # a few tool sets, not all
+        self._shapes[fingerprint] = {"shapes": shapes, "labels": labels}
         return shapes, labels
 
     def wizard_screen(self):

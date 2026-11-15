@@ -34,6 +34,27 @@ DOMAIN_NAMES = {
 }
 
 
+KINDS = {
+    "media_player": "media player",
+    "binary_sensor": "sensor",
+    "input_boolean": "toggle",
+    "climate": "thermostat",
+    "cover": "blind",
+}
+
+
+def say_what_it_is(name, domain, area=None):
+    """A device's name as a guest can understand it with no other context: "Eilish" is
+    "Eilish (bedroom media player)". A name that already says what it is stays as it is."""
+    kind = KINDS.get(domain, words(domain))
+    if kind.split()[-1].casefold() in name.casefold():
+        return name
+    place = str(area or "").strip()
+    if place and place.casefold() not in name.casefold():
+        kind = place.lower() + " " + kind
+    return f"{name} ({kind})"
+
+
 def branch(label, children):
     return {"label": label, "children": children}
 

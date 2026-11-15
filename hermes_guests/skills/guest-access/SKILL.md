@@ -74,7 +74,9 @@ person's actions and resources. Its fields refer to actual approved inputs.
 - `action` identifies an input with action values, when the tool has one.
 - `resource` identifies the selected resource input.
 - `resource_labels` maps exact selected IDs to names verified through resource
-  discovery. The card retains the canonical IDs beside these names.
+  discovery. When a name doesn't say what the thing is, add it, such as
+  “Eilish (bedroom speaker)”: the guest sees these names without any other context.
+  The card retains the canonical IDs beside these names.
 - `labels` gives understandable names to remaining inputs, such as “Events per
   request” or “Include private events”. Every restriction is still rendered.
 - `namespace` identifies an exact category already embedded in every selected
