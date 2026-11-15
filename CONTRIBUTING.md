@@ -31,7 +31,7 @@ individual commands and optional model evaluations.
 
 Automated tests use disposable Hermes homes, recording Telegram transport and
 synthetic services. Human testing starts with the README and
-[sharing scenarios](docs/human-test.md). Use consenting participants and services
+[sharing scenarios](docs/scenarios.md). Use consenting participants and services
 you're authorized to test.
 
 To try the README install and first guest invitation locally, run

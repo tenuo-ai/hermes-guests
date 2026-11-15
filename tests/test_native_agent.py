@@ -16,6 +16,7 @@ from hermes_guests.model import iso
 from hermes_guests.schemas import GUEST_SCHEMAS
 from hermes_guests.store import FileState
 from hermes_guests.transport import LocalBroker
+from tests.tiers import slow
 
 
 class NativeAgentTests(unittest.TestCase):
@@ -28,27 +29,34 @@ class NativeAgentTests(unittest.TestCase):
                 "Set PYTHONPATH to the pinned Hermes source for native integration tests."
             )
 
+    @slow
     def test_native_agent_uses_only_scoped_proxy_and_isolated_context(self):
         self.run_case(delegation=False)
 
+    @slow
     def test_native_agent_automatically_runs_narrowed_subagent(self):
         self.run_case(delegation=True)
 
     def test_unfamiliar_plugin_runs_through_native_agent_without_adapter(self):
         self.run_case(delegation=False, generic=True)
 
+    @slow
     def test_unfamiliar_plugin_automatically_delegates_through_native_agent(self):
         self.run_case(delegation=True, generic=True)
 
+    @slow
     def test_chat_only_native_agent_has_no_tools(self):
         self.run_case(delegation=False, chat_only=True)
 
+    @slow
     def test_access_whose_only_tool_is_now_never_shared_still_gets_a_reply_without_tools(self):
         self.run_case(delegation=False, generic=True, listed=True)
 
+    @slow
     def test_native_agent_uses_exact_grouped_tool_permissions(self):
         self.run_case(delegation=False, generic=True, grouped=True)
 
+    @slow
     def test_guest_memory_survives_new_without_owner_or_other_guest_context(self):
         self.run_case(delegation=False, chat_only=True, memory=True)
 

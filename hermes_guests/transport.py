@@ -53,7 +53,13 @@ class LocalBroker:
                     return
                 try:
                     size = int(self.headers.get("Content-Length", "0"))
-                    if not 0 < size <= 65536 or self.path not in {"/call", "/delegate", "/memory"}:
+                    if not 0 < size <= 65536 or self.path not in {
+                        "/call",
+                        "/delegate",
+                        "/memory",
+                        "/zone",
+                        "/ask",
+                    }:
                         raise GuestsError("Invalid local request.")
                     token = self.headers.get("Authorization", "").removeprefix("Bearer ")
                     with broker.lock:
@@ -61,7 +67,24 @@ class LocalBroker:
                     if not binding or not hmac.compare_digest(token, binding["token"]):
                         raise GuestsError("Local session is unavailable.")
                     body = json.loads(self.rfile.read(size))
-                    if self.path == "/memory":
+                    if self.path == "/ask":
+                        asks = getattr(broker, "ask", None)
+                        if binding["delegation"] or asks is None:
+                            raise GuestsError("Only the guest can ask the owner for more.")
+                        result = broker.context.copy().run(
+                            in_own_profile, asks, binding["actor"], binding["share_id"], body
+                        )
+                    elif self.path == "/zone":
+                        if binding["delegation"]:
+                            raise GuestsError("Only the guest can set their time zone.")
+                        result = broker.context.copy().run(
+                            in_own_profile,
+                            broker.service.set_guest_zone,
+                            binding["actor"],
+                            binding["share_id"],
+                            body.get("time_zone"),
+                        )
+                    elif self.path == "/memory":
                         result = broker.context.copy().run(
                             in_own_profile,
                             broker.service.admit_memory,
@@ -188,7 +211,10 @@ class LocalBroker:
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Content-Length", str(len(reply.body)))
                 self.end_headers()
-                self.wfile.write(reply.body)
+                try:
+                    self.wfile.write(reply.body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # the guest's process already has what it needed and hung up
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True

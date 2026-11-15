@@ -307,8 +307,9 @@ def subset(child, parent):
 
 
 def normalize_tools(requested, resolver, *, parent=None):
-    if not isinstance(requested, list) or len(requested) > 32:
-        raise GuestsError("Choose at most 32 tool permission rules for one person.")
+    # No fixed count: what one person's access can hold is checked when it is signed.
+    if not isinstance(requested, list) or len(requested) > 2000:
+        raise GuestsError("Choose the tools this person may use.")
     result = []
     parents = {p["name"]: p for p in parent or []}
     for item in requested:
@@ -617,7 +618,7 @@ def tool_selections(entries):
 
 TOOL_SELECTION_SCHEMA = {
     "type": "array",
-    "maxItems": 32,
+    "maxItems": 2000,
     "items": {
         "type": "object",
         "additionalProperties": False,

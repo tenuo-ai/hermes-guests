@@ -8,6 +8,7 @@ from hermes_guests.core import GuestsService
 from hermes_guests.model import GuestsError, iso
 from hermes_guests.never import NeverShare, fold
 from hermes_guests.store import FileState
+from tests.tiers import slow
 
 LIBRARY = {
     "name": "library_find",
@@ -200,6 +201,7 @@ class OneToolTests(unittest.TestCase):
         )
         self.assertIsNone(never.blocked_for("library_find", {"query": "front_door_lock"}))
 
+    @slow
     def test_one_tool_rules_narrow_that_tools_choices_only(self):
         never = NeverShare(
             scoped=[{"tool": "light_set", "field": "light", "value": "front_door_lock"}]
