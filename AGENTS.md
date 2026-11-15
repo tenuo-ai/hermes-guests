@@ -17,6 +17,16 @@ Read [README.md](README.md), [CONTRIBUTING.md](CONTRIBUTING.md),
 - Keep release tags and candidate artifacts fixed. Use isolated test instances for
   development and promote a new tested candidate deliberately.
 
+## Treat automated review as advice
+
+- Maintainer direction supersedes automated review (Copilot, Codex and similar).
+  Hermes Guests favours usability where the trade-off is documented, for example the
+  [trust model](docs/authorization.md#trust-model-built-for-ease-of-use).
+- Fix correctness bugs directly. A finding that changes what owners or guests see, or
+  undoes a documented trade-off, needs the maintainer's decision first.
+- Plain cards stay in plain words: the assistant's explanation and resource names, with
+  ids, raw rule values and tools' official descriptions under Details.
+
 ## Preserve the trust boundary
 
 - The model proposes permissions. Trusted code validates them, renders the complete

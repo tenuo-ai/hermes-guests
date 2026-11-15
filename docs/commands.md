@@ -11,8 +11,7 @@ Send these in your private Telegram chat with the bot.
 | Command | What it does |
 | --- | --- |
 | `/guests_setup` | Set up sharing: the tools you're willing to share, the never-share list, and how long guest data is kept after access ends. Run again to change any of them or to approve newly connected tools. |
-| `/guests` | See who has access, pending reviews and invitations. Buttons: **Add a guest**, **Check sharing**, and **Activity** for everyone's recent activity. Open a guest for **Change what they can use**, **Extend**, **Activity**, **End access** and **End and delete data**. **Extend** offers increments that fit within 30 days from now, or no end date. Every change shows the full review first. |
-| `/guests_new <name>` | Add a guest with buttons: chat only or chosen tools, then how long, then the review. |
+| `/guests` | See who has access, pending reviews and invitations. Buttons: **Add a guest**, **Check sharing**, and **Activity** for everyone's recent activity. **Add a guest** and a guest's **Change what they can use** ask you in words first, with **Pick from a list instead** for a menu: each connected service, then the things it acts on (a kind of device, then each device; a folder; a calendar), then what may be done to each. **‹ Back** moves up a level. Open a guest for **Change what they can use**, **Extend**, **Activity**, **End access** and **End and delete data**. **Extend** offers increments that fit within 30 days from now, or no end date. Every change shows the full review first. |
 | `/cancel` | Cancel a pending typed answer, such as a word for the never-share list. |
 
 `/guests_recover` resets the sharing identity after unrecoverable key loss; see
@@ -27,15 +26,17 @@ Your ordinary Hermes commands remain available in your owner chat.
 | --- | --- |
 | `/help` | Show current permissions and access controls. |
 | `/access` | Show approved permissions, end time and access status. |
-| `/renew` | Request more time for active, time-limited access. Expired guests can use the renewal button. The owner reviews the request. |
+| `/renew` | Request more time. While access is on it's added to the current end; after it ends it runs from approval. The owner reviews the request. |
 | `/new` | Start a fresh conversation, keeping current permissions and authorized saved preferences. |
-| `/cancel` | Cancel a pending text request for more access. |
+| `/timezone <city or zone>` | Show times in your own time zone, for example `/timezone Vancouver`. |
+| `/cancel` | Cancel a pending request for more access or more time. |
 | `/start` | Open the invitation when following its link, or show the guest's permissions once joined. |
 
 Guests can also say “What can I do?” or “Request access to …”, and use
 **Request more access** or **Request more time**. Access changes require owner
-approval. A guest can have one request open at a time and make three a day, for
-more access and for more time alike. After access is ended, the owner can send a
+approval. A guest can have one request open at a time. Only requests the owner
+declines count: after three declines in a day, for more access or more time alike,
+the guest waits until the next day. After access is ended, the owner can send a
 new invitation.
 
 ## Never-share list

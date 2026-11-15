@@ -7,7 +7,7 @@ from hermes_guests.ui import heading_entities
 
 class PresentationTests(unittest.TestCase):
     def test_headers_use_utf16_offsets_with_unicode_names(self):
-        text = 'Access for Alex 👩🏽‍💻 李\n\nConnected tools\nPermission group 1\n• Device — "B"\nEnds tomorrow\n'
+        text = 'Exact access for Alex 👩🏽‍💻 李\n\nWhat they can do\nPermission group 1\n• Device — "B"\n\nWhen it ends\nEnds tomorrow\n'
         entities = heading_entities(text)
         encoded = text.encode("utf-16-le")
         self.assertEqual(
@@ -15,7 +15,12 @@ class PresentationTests(unittest.TestCase):
                 encoded[e.offset * 2 : (e.offset + e.length) * 2].decode("utf-16-le")
                 for e in entities
             ],
-            ["Access for Alex 👩🏽‍💻 李", "Connected tools", "Permission group 1", "Ends tomorrow"],
+            [
+                "Exact access for Alex 👩🏽‍💻 李",
+                "What they can do",
+                "Permission group 1",
+                "When it ends",
+            ],
         )
         self.assertEqual(text.count('"B"'), 1)
 
