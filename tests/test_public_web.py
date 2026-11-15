@@ -10,6 +10,7 @@ from hermes_guests.core import GuestsService
 from hermes_guests.model import GuestsError, iso
 from hermes_guests.public_web import is_public_address, is_public_url, web_addresses
 from hermes_guests.store import FileState
+from tests.tiers import slow
 
 PAGE = {
     "name": "page_read",
@@ -123,6 +124,7 @@ class AddressTests(unittest.TestCase):
         with patch.object(public_web, "lookup", fake_lookup):
             self.assertTrue(any(not is_public_url(u) for u in web_addresses(deep)))
 
+    @slow
     def test_addresses_inside_text_or_broken_up_are_still_found(self):
         self.assertEqual(
             web_addresses("Open http://127.0.0.1/admin now."), ["http://127.0.0.1/admin"]

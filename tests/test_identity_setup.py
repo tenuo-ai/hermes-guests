@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from hermes_guests.model import GuestsError
 from hermes_guests.plugin import other_people, owner_identity
+from tests.tiers import slow
 
 
 @unittest.skipUnless(importlib.util.find_spec("hermes_cli"), "Native Hermes source required")
@@ -24,6 +25,7 @@ class IdentitySetupTests(unittest.TestCase):
     def test_existing_numeric_owner_requires_no_additional_configuration(self):
         self.assertEqual(self.check(allowed="100"), "100")
 
+    @slow
     def test_sole_native_paired_owner_is_automatically_reused(self):
         self.assertEqual(self.check(paired=["100"]), "100")
 

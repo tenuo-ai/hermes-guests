@@ -11,6 +11,7 @@ from hermes_guests.core import GuestsService
 from hermes_guests.model import GuestsError
 from hermes_guests.permissions import normalize_tools, proxy_schema, rebase_schema_refs
 from hermes_guests.store import FileState
+from tests.tiers import slow
 
 SCHEMA = {
     "name": "device_control",
@@ -234,6 +235,7 @@ class GroupedRuleTests(unittest.TestCase):
         self.call("door", "B", "unlock")
         self.call("light", "E", "off")
 
+    @slow
     def test_child_cannot_mix_or_expand_parent_rules(self):
         for requested in [
             rule("door", ["C"], ["unlock"]),

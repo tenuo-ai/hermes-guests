@@ -9,6 +9,7 @@ from hermes_guests.core import GuestsService
 from hermes_guests.model import GuestsError, iso, review, timestamp
 from hermes_guests.schemas import GUEST_SCHEMAS
 from hermes_guests.store import FileState
+from tests.tiers import slow
 
 CATALOG = {
     "light.porch": {"name": "Porch light"},
@@ -71,7 +72,7 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaises(GuestsError):
             self.s.delegate("200", sid, {"tools": []}, task="Execute anything")
         self.s.admit_chat("200", sid)
-        self.assertIn("Chat only", active["text"])
+        self.assertIn("Chat with the assistant only", active["text"])
         p = self.s.prepare("100", "Alex", None, share_id=sid, action="revoke")
         self.s.approve("100", p["proposal_id"])
         with self.assertRaises(GuestsError):
@@ -97,7 +98,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(db["proposals"][p["proposal_id"]]["scope"]["expires_at"], end)
         self.assertTrue(claim["claim_id"])
 
-    def test_invitation_window_is_reviewed_preserved_on_retry_and_capped_by_access(self):
+    def test_invitation_window_is_reviewed_preserved_on_retry_and_not_cut_by_access_length(self):
         now = [round(self.s.clock(), 3)]
         self.s.clock = lambda: now[0]
         p = self.s.prepare(
@@ -109,7 +110,9 @@ class LifecycleTests(unittest.TestCase):
             },
             invitation_seconds=86400,
         )
-        self.assertIn("within 24 hours after sending", p["text"])
+        self.assertNotIn("invitation", p["text"].lower())  # Details is the access itself
+        saved = self.s.ledger.snapshot()["proposals"][p["proposal_id"]]
+        self.assertEqual(saved["invitation_seconds"], 86400)
         invitation = self.s.approve("100", p["proposal_id"])
         self.assertEqual(timestamp(invitation["expires_at"]), now[0] + 86400)
         now[0] += 3600
@@ -119,7 +122,7 @@ class LifecycleTests(unittest.TestCase):
         active = self.s.accept_claim("100", claim["claim_id"])
         self.assertEqual(
             timestamp(self.s.get_access("100", active["share_id"])["scope"]["expires_at"]),
-            now[0] - 3600 + 172800,
+            now[0] + 172800,  # the length starts when the owner confirms the account
         )
         short = self.s.prepare(
             "100",
@@ -130,8 +133,10 @@ class LifecycleTests(unittest.TestCase):
             },
             invitation_seconds=86400,
         )
-        capped = self.s.approve("100", short["proposal_id"])
-        self.assertEqual(timestamp(capped["expires_at"]), now[0] + 300)
+        # Five minutes of access is five minutes from when it starts, so the invitation
+        # can still be opened later in its own window.
+        short_invite = self.s.approve("100", short["proposal_id"])
+        self.assertEqual(timestamp(short_invite["expires_at"]), now[0] + 86400)
 
     def test_invitation_window_tampering_is_rejected_and_legacy_proposals_still_work(self):
         p = self.s.prepare("100", "Alex", self.access(lights=["light.porch"]))
@@ -147,7 +152,7 @@ class LifecycleTests(unittest.TestCase):
             saved.pop("invitation_seconds")
             saved["digest"] = digest({k: v for k, v in saved.items() if k != "digest"})
         self.assertEqual(self.s.approve("100", legacy["proposal_id"])["status"], "invited")
-        for invalid in (True, "86400", 59, 86401, 0):
+        for invalid in (True, "86400", 59, 2592001, 0):
             with self.subTest(invalid=invalid), self.assertRaises(GuestsError):
                 self.s.prepare(
                     "100", "Alex", self.access(lights=["light.porch"]), invitation_seconds=invalid
@@ -298,7 +303,9 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("Porch light", text)
         self.assertIn("Guest room light", text)
         self.assertIn("public web", text)
-        self.assertIn("Scope is limited to the capabilities and inputs above", text)
+        self.assertIn("What they can do", text)
+        self.assertIn("When it ends", text)
+        self.assertNotIn("Scope is limited", text)  # boilerplate is gone
 
     def test_effect_boundary_and_signed_allow_deny_receipts(self):
         a = self.activate()
@@ -329,6 +336,7 @@ class LifecycleTests(unittest.TestCase):
             [x["decision"] for x in rows if x["kind"] == "decision"], ["ALLOW", "DENY"]
         )
 
+    @slow
     def test_wrong_guest_and_unknown_guest_have_no_effects(self):
         a = self.activate()
         with self.assertRaises(GuestsError):

@@ -80,9 +80,9 @@ class PermissionCardTests(unittest.TestCase):
         self.assertIn("Door B (lock.door_b)\n• Lock or unlock", text)
         for name in ("Light C (light.c)", "Light D (light.d)", "Light E (light.e)"):
             self.assertIn(name + "\n• Turn off or turn on", text)
-        for raw in ("Domain", "Permission group", "device_control", '"turn_on"'):
+        for raw in ("Domain", "Permission group", '"turn_on"'):
             self.assertNotIn(raw, text)
-        self.assertIn("Ends ", text)
+        self.assertIn("Lasts 1 hour from approval", text)
 
     def test_descriptions_survive_restart_renewal_and_permission_checks(self):
         sid = self.activate(device_selection())
@@ -135,16 +135,15 @@ class PermissionCardTests(unittest.TestCase):
         text = self.prepare(tools)["text"]
         self.assertEqual(text.count("Light C (light.c)"), 1)
         self.assertIn(
-            "Light C (light.c)\n• Turn off or turn on\n  Tool: Control selected devices\n"
-            "• Read state and details\n  Tool: Read device state and details",
+            "Light C (light.c)\n• Turn off or turn on\n  Tool: device_control — Control selected devices\n"
+            "• Read state and details\n  Tool: device_state — Read device state and details",
             text,
         )
         self.assertIn(
             "Temperature sensor (sensor.temperature)\n• Read state and details\n"
-            "  Tool: Read device state and details",
+            "  Tool: device_state — Read device state and details",
             text,
         )
-        self.assertNotIn("device_state", text)
         sid = self.activate(tools)
         self.service.call("200", sid, "device_state", {"device": "sensor.temperature"})
         with self.assertRaises(GuestsError):
@@ -238,20 +237,23 @@ class PermissionCardTests(unittest.TestCase):
             },
         ]
         text = self.prepare(misleading)["text"]
-        # Whatever the wording says, the tool's own description and input names are there.
+        # Whatever the wording says, the tool's real name and its own words are there.
         self.assertIn(
-            "• Read state and details\n  Tool: Unlock a door and leave it unlocked for the "
-            "given number of minutes",
+            "• Read state and details\n  Tool: door_unlock — Unlock a door and leave it "
+            "unlocked for the given number of minutes",
             text,
         )
         self.assertIn("Refresh interval (minutes) — between 1 and 600", text)
-        self.assertIn("• Browse titles\n  Tool: Permanently delete every title in a library", text)
+        self.assertIn(
+            "• Browse titles\n  Tool: media_delete — Permanently delete every title in a library",
+            text,
+        )
         self.assertIn("Porch light (front)", text)
-        # Wording that is the tool's own description is not repeated.
+        # Every tool line names the real tool.
         honest = [dict(misleading[1], presentation={"resource": "library"})]
-        self.assertNotIn("Tool:", self.prepare(honest)["text"])
+        self.assertIn("Tool: media_delete", self.prepare(honest)["text"])
 
-    def test_wording_chosen_for_a_review_brings_the_tools_whole_description_with_it(self):
+    def test_details_name_the_tool_with_the_opening_of_its_own_words(self):
         self.schemas["media_manage"] = {
             "name": "media_manage",
             "description": "Manage a media library. Permanently delete every title in the\n"
@@ -274,32 +276,12 @@ class PermissionCardTests(unittest.TestCase):
             return self.prepare([entry])["text"]
 
         self.assertIn(
-            "• Browse titles\n  Tool: Manage a media library. Permanently delete every title "
-            "in the selected library\n",
+            "• Browse titles\n  Tool: media_manage — Manage a media library\n",
             card("Browse titles"),
         )
-        # Even the tool’s opening sentence can leave out what it does.
-        for own_words in ("Manage a media library", None):
-            with self.subTest(wording=own_words):
-                self.assertIn("• Manage a media library\n", card(own_words))
-                self.assertIn("Permanently delete every title", card(own_words))
-        # A tool that describes itself in no words at all is shown by its name.
-        for nothing in ("", "   \n", "."):
-            self.schemas["media_manage"]["description"] = nothing
-            with self.subTest(description=nothing):
-                self.assertIn("• Browse titles\n  Tool: media manage\n", card("Browse titles"))
-                for own_words in ("media manage", None):
-                    self.assertIn("• media manage\n", card(own_words))
-                    self.assertNotIn("Tool:", card(own_words))
-                plain = {"name": "media_manage", "constraints": {"library": {"any": True}}}
-                self.assertIn("\nmedia manage\n", self.prepare([plain])["text"])
-        # A description that runs to paragraphs is cut at a word, and says that it was cut.
-        self.schemas["media_manage"]["description"] = "Manage a media library. " + "word " * 200
-        shown = next(
-            line for line in card("Browse titles").split("\n") if line.startswith("  Tool: ")
-        )
-        self.assertLessEqual(len(shown), 320)
-        self.assertTrue(shown.endswith("word…"), shown[-30:])
+        # A tool that describes itself in no words is shown by its name alone.
+        self.schemas["media_manage"]["description"] = ""
+        self.assertIn("• Browse titles\n  Tool: media_manage\n", card("Browse titles"))
 
     def test_unmentioned_limits_are_always_rendered(self):
         tools = device_selection()
@@ -375,3 +357,22 @@ class PermissionCardTests(unittest.TestCase):
         text = self.prepare(tools)["text"]
         self.assertIn("Door B (lock.door_b)", text)
         self.assertIn("Light E (light.e)", text)
+
+
+class ToolWarningTests(unittest.TestCase):
+    def test_details_show_warnings_the_first_sentence_would_hide(self):
+        from hermes_guests.presentation import warnings
+
+        self.assertEqual(
+            warnings(
+                {"description": "Manage a media library. Permanently delete every title in it."}
+            ),
+            ["Permanently delete every title in it."],
+        )
+        self.assertEqual(
+            warnings({"description": "Permanently delete a note. This cannot be undone."}),
+            ["This cannot be undone."],
+        )
+        self.assertEqual(
+            warnings({"description": "Read a note. Use the exact id from a search."}), []
+        )

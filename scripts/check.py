@@ -24,7 +24,7 @@ def main():
     run("scripts/check_public.py")
     run("-m", "ruff", "check", "hermes_guests", "tests", "scripts")
     run("-m", "ruff", "format", "--check", "hermes_guests", "tests", "scripts")
-    run("-m", "unittest", "discover", "-s", "tests", "-v")
+    run("scripts/run_tests.py")  # every tier, each test file in its own process
     run("experiments/released_guard.py")
     with tempfile.TemporaryDirectory(prefix="guests-wheel-") as directory:
         run("-m", "build", "--wheel", "--outdir", directory)

@@ -17,6 +17,7 @@ from hermes_guests.recovery import recover_local_authority
 from hermes_guests.schemas import GUEST_SCHEMAS
 from hermes_guests.store import FileState
 from hermes_guests.transport import LocalBroker
+from tests.tiers import slow
 
 
 class RecoveryProfileTests(unittest.TestCase):
@@ -91,6 +92,7 @@ class RecoveryProfileTests(unittest.TestCase):
         self.assertEqual((home / ".hermes-guests-profile").read_text(), self.sid)
         self.assertTrue((home / "state.db").is_file())
 
+    @slow
     def test_existing_unmarked_native_profile_with_session_database_is_still_refused(self):
         from unittest.mock import patch
 
@@ -110,6 +112,7 @@ class RecoveryProfileTests(unittest.TestCase):
         self.assertTrue(database.exists())
         self.assertFalse((home / ".hermes-guests-profile").exists())
 
+    @slow
     def test_guest_profile_gets_no_copy_of_the_plugin_when_share_is_installed_as_a_package(self):
         from unittest.mock import patch
 
@@ -167,6 +170,7 @@ class RecoveryProfileTests(unittest.TestCase):
         self.assertEqual(r.cleanup("100"), [])
         self.assertTrue(home.exists())
 
+    @slow
     def test_native_guest_memory_is_signed_and_bound_to_identity_and_current_access(self):
         from hermes_guests.model import GUEST_MEMORY_CAPABILITY
 
@@ -476,6 +480,7 @@ class RecoveryProfileTests(unittest.TestCase):
                 self.assertFalse(self.service._keep_standing(db, db["shares"][self.sid]))
         self.assertEqual(self.service.get_access("100", self.sid)["warrant_id"], before)
 
+    @slow
     def test_expired_signed_grant_is_rejected_before_model_lookup_even_with_active_local_state(
         self,
     ):

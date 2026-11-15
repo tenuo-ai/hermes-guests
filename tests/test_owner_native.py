@@ -8,26 +8,34 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.tiers import slow
+
 
 @unittest.skipUnless(importlib.util.find_spec("run_agent"), "Native Hermes source required")
 class NativeOwnerFlowTests(unittest.TestCase):
+    @slow
     def test_git_plugin_owner_and_guest_use_adjacent_package(self):
         if not (Path(__file__).resolve().parent.parent / "plugin.yaml").is_file():
             self.skipTest("Git-directory journey is verified in source installation tests")
         self.run_flow(git_install=True)
 
+    @slow
     def test_owner_discovers_prepares_confirms_and_guest_uses_unknown_plugin(self):
         self.run_flow(git_install=False)
 
+    @slow
     def test_saved_tool_selection_gets_sharing_only_after_owner_enables_it(self):
         self.run_flow(git_install=True, saved_tools=True)
 
+    @slow
     def test_owner_and_guest_flow_with_both_plugins_enabled(self):
         self.run_flow(git_install=False, tenuo="signed")
 
+    @slow
     def test_unconfigured_other_plugin_preserves_normal_owner_and_guest_flow(self):
         self.run_flow(git_install=False, tenuo="unconfigured")
 
+    @slow
     def test_other_plugin_missing_required_warrant_still_blocks_owner_tools(self):
         self.run_flow(git_install=False, tenuo="missing")
 
