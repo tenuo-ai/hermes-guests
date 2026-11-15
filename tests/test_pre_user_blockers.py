@@ -191,8 +191,8 @@ class IntakeTests(unittest.TestCase):
             {"kind": "outcome", "call_id": "c2", "at": 3, "outcome": "returned"},
         ]
         text = activity_text("Alex", rows, "UTC")
-        self.assertIn("web_extract : refused before it ran", text)
-        self.assertIn("web_search : done", text)
+        self.assertIn("web_extract → refused before it ran", text)
+        self.assertIn("web_search → done", text)
         self.assertNotIn("no result recorded", text)
 
     def test_inputs_whose_type_is_a_list_do_not_break_discovery(self):
