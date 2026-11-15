@@ -99,8 +99,8 @@ def normalize_presentation(value, entry):
     value = copy.deepcopy(value)
     if "operation" in value and not value["operation"].strip():
         raise GuestsError("Give the operation a readable name.")
-    if "operation" in value and ("action" in value or "resource" not in value):
-        raise GuestsError("Use operation with a resource and no action input.")
+    # Any tool can carry a plain explanation for the owner's card. It never replaces the
+    # rules: the action and resource values are shown from the rules themselves.
     if any(
         not label.strip()
         for group in ("labels", "resource_labels")
@@ -232,7 +232,7 @@ def review_lines(entry):
     return lines
 
 
-TOOL_DESCRIPTION_LIMIT = 300  # how much of a tool's own description a review shows
+TOOL_DESCRIPTION_LIMIT = 3000  # the whole stored description: Details is the complete view
 
 
 def own_description(schema):
@@ -241,6 +241,9 @@ def own_description(schema):
     text = " ".join(str(schema.get("description") or "").split()).rstrip(".")
     if len(text) > TOOL_DESCRIPTION_LIMIT:
         text = text[:TOOL_DESCRIPTION_LIMIT].rsplit(" ", 1)[0].rstrip(",;:.") + "…"
+    if len(str(schema.get("description") or "")) >= 3000:
+        # Stored descriptions stop at 3000 characters; say so rather than look complete.
+        text += " … [description cut at 3000 characters; check the tool before sharing it]"
     return text
 
 

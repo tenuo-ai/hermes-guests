@@ -54,7 +54,7 @@ To test a different committed source, pass its Git URL as the second argument.
 To run with the official Home Assistant plugin against a simulated service,
 install its Python dependencies in the Hermes environment and pass the plugin
 directory as the third argument. For live testing, use a dedicated bot and the
-[sharing scenarios](human-test.md).
+[sharing scenarios](scenarios.md).
 
 ## Acceptance checklist
 
@@ -94,7 +94,7 @@ quality. Record those checks separately in the human test.
 
 ## Real-model scenario evaluation
 
-`scripts/evaluate_journey.py` runs the native owner and guest with a hosted API-key
+`tests/evaluate_journey.py` runs the native owner and guest with a hosted API-key
 model, synthetic tools and a recording Telegram bot. It covers chat-only sharing,
 company filings, calendar reading, reminders, media and mixed device controls.
 It uses the installed skill to interpret requests, then exercises actual proposal,
@@ -108,7 +108,7 @@ process. The automated Codex test exercises the native guest tool loop against
 recorded Responses fixtures through the host credential request boundary.
 
 ```sh
-python scripts/evaluate_journey.py --case calendar --output /tmp/calendar-result.json
+python tests/evaluate_journey.py --case calendar --output /tmp/calendar-result.json
 ```
 
 The report contains synthetic scope, card text, a guest response and effect counts.
@@ -119,7 +119,7 @@ remain part of live acceptance.
 ## Engineering acceptance
 
 A human test begins with the repository README and the tester's own
-Hermes installation. [Sharing scenarios](human-test.md)
+Hermes installation. [Sharing scenarios](scenarios.md)
 
 Use an isolated engineering instance, recording integrations and consenting
 participants for fault injection and deterministic boundary checks. Verify

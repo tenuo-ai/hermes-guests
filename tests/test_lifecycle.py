@@ -97,7 +97,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(db["proposals"][p["proposal_id"]]["scope"]["expires_at"], end)
         self.assertTrue(claim["claim_id"])
 
-    def test_invitation_window_is_reviewed_preserved_on_retry_and_capped_by_access(self):
+    def test_invitation_window_is_reviewed_preserved_on_retry_and_not_cut_by_access_length(self):
         now = [round(self.s.clock(), 3)]
         self.s.clock = lambda: now[0]
         p = self.s.prepare(
@@ -119,7 +119,7 @@ class LifecycleTests(unittest.TestCase):
         active = self.s.accept_claim("100", claim["claim_id"])
         self.assertEqual(
             timestamp(self.s.get_access("100", active["share_id"])["scope"]["expires_at"]),
-            now[0] - 3600 + 172800,
+            now[0] + 172800,  # the length starts when the owner confirms the account
         )
         short = self.s.prepare(
             "100",
@@ -130,8 +130,10 @@ class LifecycleTests(unittest.TestCase):
             },
             invitation_seconds=86400,
         )
-        capped = self.s.approve("100", short["proposal_id"])
-        self.assertEqual(timestamp(capped["expires_at"]), now[0] + 300)
+        # Five minutes of access is five minutes from when it starts, so the invitation
+        # can still be opened later in its own window.
+        short_invite = self.s.approve("100", short["proposal_id"])
+        self.assertEqual(timestamp(short_invite["expires_at"]), now[0] + 86400)
 
     def test_invitation_window_tampering_is_rejected_and_legacy_proposals_still_work(self):
         p = self.s.prepare("100", "Alex", self.access(lights=["light.porch"]))
@@ -147,7 +149,7 @@ class LifecycleTests(unittest.TestCase):
             saved.pop("invitation_seconds")
             saved["digest"] = digest({k: v for k, v in saved.items() if k != "digest"})
         self.assertEqual(self.s.approve("100", legacy["proposal_id"])["status"], "invited")
-        for invalid in (True, "86400", 59, 86401, 0):
+        for invalid in (True, "86400", 59, 2592001, 0):
             with self.subTest(invalid=invalid), self.assertRaises(GuestsError):
                 self.s.prepare(
                     "100", "Alex", self.access(lights=["light.porch"]), invitation_seconds=invalid
