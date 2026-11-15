@@ -71,19 +71,15 @@ class NativeGuestRunner:
         if self.profile_factory:
             home = Path(self.profile_factory(name))
         else:
-            from hermes_cli.profiles import create_profile, get_profile_dir, profile_exists
+            from .compat import guest_profile
 
-            if profile_exists(name):
-                home = get_profile_dir(name)
-            else:
-                home = create_profile(
-                    name,
-                    no_alias=True,
-                    no_skills=True,
-                    description="Hermes Guests isolated guest",
-                    soul="You help a guest only within the access supplied by Hermes Guests.",
-                )
-                created = True
+            home, created = guest_profile(
+                name,
+                no_alias=True,
+                no_skills=True,
+                description="Hermes Guests isolated guest",
+                soul="You help a guest only within the access supplied by Hermes Guests.",
+            )
         if home.is_symlink() or (home / "memories").is_symlink():
             raise GuestsError("The guest profile has an unsafe storage path.")
         if any((home / "memories" / name).is_symlink() for name in ("MEMORY.md", "USER.md")):
@@ -258,6 +254,12 @@ class NativeGuestRunner:
                 },
                 "tool_schemas": schemas,
                 "delegation": bool(delegation),
+                # Times the model can say in the reader's own clock, and when this access
+                # last changed, so refusals from before a renewal are not taken as current.
+                "zone": self.service.zone_of(record),
+                "zone_is_theirs": bool(record.get("guest_zone")),
+                "now": self.service.clock(),
+                "changed_at": record.get("changed_at") or record.get("updated_at"),
                 "guest_memory": bool(record["scope"].get("guest_memory")) and not delegation,
             }
             # API keys and turn tokens travel only through the worker pipe.
@@ -393,9 +395,9 @@ class NativeGuestRunner:
                         if home is None:
                             continue
                     else:
-                        from hermes_cli.profiles import get_profile_dir
+                        from .compat import guest_profile_dir
 
-                        home = self.context.copy().run(in_own_profile, get_profile_dir, name)
+                        home = self.context.copy().run(in_own_profile, guest_profile_dir, name)
                     if not home.exists() and not home.is_symlink():
                         self.profiles.pop(sid, None)
                         current.setdefault("profile_deleted_at", self.service.clock())
@@ -414,9 +416,9 @@ class NativeGuestRunner:
                     if self.profile_deleter:
                         self.profile_deleter(name)
                     else:
-                        from hermes_cli.profiles import delete_profile
+                        from .compat import delete_guest_profile
 
-                        self.context.copy().run(in_own_profile, delete_profile, name, yes=True)
+                        self.context.copy().run(in_own_profile, delete_guest_profile, name)
                     self.profiles.pop(sid, None)
                     current["profile_deleted_at"] = self.service.clock()
                 self.service.audit.event("profile_removed", share_id=sid)

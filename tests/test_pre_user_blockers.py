@@ -17,6 +17,7 @@ from hermes_guests.permissions import (
 )
 from hermes_guests.schemas import GUEST_SCHEMAS
 from hermes_guests.store import FileState
+from tests.tiers import slow
 
 LIBRARY = {
     "name": "library_find",
@@ -191,8 +192,8 @@ class IntakeTests(unittest.TestCase):
             {"kind": "outcome", "call_id": "c2", "at": 3, "outcome": "returned"},
         ]
         text = activity_text("Alex", rows, "UTC")
-        self.assertIn("web_extract : refused before it ran", text)
-        self.assertIn("web_search : done", text)
+        self.assertIn("web_extract → refused before it ran", text)
+        self.assertIn("web_search → done", text)
         self.assertNotIn("no result recorded", text)
 
     def test_inputs_whose_type_is_a_list_do_not_break_discovery(self):
@@ -747,6 +748,7 @@ class OwnerContinuityTests(unittest.TestCase):
             clock=time.time,
         )
 
+    @slow
     def test_legacy_setup_stays_enabled_without_the_old_owner_warrant_file(self):
         with self.s.ledger.transaction() as db:
             db["setup"]["owner_authority"] = {"warrant_id": "old", "expires_at": 0}
@@ -808,6 +810,7 @@ class OwnerContinuityTests(unittest.TestCase):
                 "/guests_setup", self.s.check_owner("100", "terminal", {}, "s2")["message"]
             )
 
+    @slow
     def test_a_different_owner_key_in_place_is_not_continued(self):
         from tenuo import SigningKey
 
@@ -853,6 +856,7 @@ class OwnerContinuityTests(unittest.TestCase):
 
 
 class RequestBoundaryTests(unittest.TestCase):
+    @slow
     def test_no_end_date_with_an_end_time_is_refused_not_widened(self):
         with tempfile.TemporaryDirectory() as temp:
             s = GuestsService(

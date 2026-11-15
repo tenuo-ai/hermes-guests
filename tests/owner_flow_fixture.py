@@ -45,6 +45,7 @@ async def main():
         {
             "name": "library_find",
             "presentation": {
+                "operation": "Search the Movies library",
                 "resource": "library",
                 "labels": {"query": "Search terms", "limit": "Results per search"},
             },
@@ -379,7 +380,7 @@ async def main():
             await message(100, "/guests_setup")
         setup = next(markup for who, text, markup in reversed(bot.sent) if markup)
         if saved_tools:
-            assert "adds Hermes Guests to your Telegram tools" in bot.sent[-1][1]
+            assert "manage guests here in chat" in bot.sent[-1][1]
         await click(100, setup.inline_keyboard[0][0].callback_data)
         assert plugin.service.owner_ready(), [(who, text) for who, text, _ in bot.sent]
         if installed and (home / "owner-state-sentinel").exists():

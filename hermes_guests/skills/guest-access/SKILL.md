@@ -41,18 +41,27 @@ Use `guests_discover` to search the installed catalog and inspect actual schemas
 returns includes an `example` selection: copy it into `scope.tools` and narrow each input's rule.
 The time limit goes inside `scope`: `duration_seconds`, `expires_at`, or `until_ended: true` when
 the owner wants access with no end date. If preparing fails, the error names the tool's inputs and
-shows a corrected selection to send again. The owner can also send `/guests_new <name>` to choose
-tools and a time limit with buttons.
+shows a corrected selection to send again. The owner can also press **Add a guest** in `/guests`,
+then **Pick from a list instead**, to choose tools and a time limit with buttons.
 For an unfamiliar tool, put its real name and input constraints in `scope.tools`:
 `equals`, `one_of`, `range`, or an explicit `any: true`. These are agent inputs,
 not a format to ask the owner to author. For relative durations, use
-`duration_seconds` (for example, twenty minutes is 1200). Trusted code computes
-and freezes the exact expiry in the review; no clock tool is needed. For an exact
-end time or to preserve existing expiry, use `expires_at` instead. Never provide both.
+`duration_seconds` (for example, twenty minutes is 1200). For new access the time
+starts when the owner approves. For "15 more minutes", "another hour" or "extend by a
+day" on someone's existing access, pass `add_seconds` and no scope timing: while their
+access is on it is added to the current end, and once it has ended it runs from
+approval. No clock tool is needed. For an exact end time or to preserve existing
+expiry, use `expires_at` instead. Never provide both.
+When the owner says where a guest is ("Mom is in Vancouver"), pass
+`guest_time_zone` (such as `America/Vancouver`). Messages to the guest use their time
+zone; messages to the owner stay in the owner's.
 When the owner specifies how long the guest has to accept, pass
 `invitation_seconds` on `guests_prepare_access` separately from `scope.duration_seconds`.
 For example, two days of access with one day to accept uses 172800 and 86400.
-The review shows the invitation window. The access end time stays fixed.
+An invitation may stay open up to 30 days but never past a fixed end, so "until Sunday
+9 pm, and keep the invite open all weekend" is `expires_at` for Sunday 9 pm plus
+`invitation_seconds` reaching it. A fixed end never moves when the guest accepts late.
+The review shows the invitation window. The access time starts when the owner approves.
 For separate operation/resource combinations on one tool, repeat its name with a
 complete constraint set for each permission group. For example, one group allows
 lock/unlock on Door B and another allows on/off on Lights C, D and E. Never combine
@@ -123,7 +132,7 @@ operation labels must accurately describe the discovered tool.
 
 "Also let Alex use the guest-room lights" is an expansion. Show added access,
 retained access, and the end time; keep existing expiry unless asked to change it.
-"Another week" is an extension. "Keep research but remove lights" is a reduction.
+"Another week" is an extension (`add_seconds`). "Keep research but remove lights" is a reduction.
 "Remove Alex's access" is revocation. Prepare each mutation for owner confirmation.
 
 For "who has access?" or "what can Alex do?", use actual effective state from
@@ -159,7 +168,7 @@ guest's overall access still requires the owner's complete review.
 
 ## Chat-only invitations
 
-The owner can also choose Chat only through `/guests_new <name>`, including when
+The owner can also choose Chat only through **Add a guest** › **Pick from a list instead**, including when
 no service tools are connected.
 
 For someone who should only converse, prepare `scope.chat_only: true` and a duration.

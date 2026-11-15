@@ -48,7 +48,7 @@ You can manage sharing from your own chat.
 | What you want | Try saying |
 | --- | --- |
 | See current access | “Who has access?” |
-| Change permissions | “Let Alex control the porch light too.” |
+| Change permissions | “Let Alex add to the shopping list too.” |
 | Give more time | “Extend Alex's access until Sunday.” |
 | End access | “End Alex's access.” |
 | Check activity | “What did Alex do today? Show the times in my timezone.” |
@@ -67,8 +67,8 @@ Data is kept until you delete it by default; you can choose automatic deletion i
 
 Prefer buttons? `/guests` shows who has access, with **Add a guest**, **Check
 sharing** and **Activity**. Open a guest to change what they can use, **Extend**
-their access, see their activity or end it. `/guests_new <name>` adds a guest step
-by step. See the
+their access, see their activity or end it. **Add a guest** asks in words, or lets
+you pick from a list. See the
 [command reference](docs/commands.md).
 
 ## How access works
@@ -88,9 +88,50 @@ conversations, memory, and access records locally in separate profiles.
 [Model setup](docs/setup-recovery.md#model-setup) ·
 [Security and limits](docs/advanced.md)
 
+## What it does on your machine
+
+- **Background work.** While the gateway runs, a maintenance task checks access every
+  minute: it renews the owner and no-end-date warrants, sends the notices before and
+  when access ends, and applies data retention.
+- **Separate guest processes.** Each guest turn runs a native Hermes agent in its own
+  process, in a separate Hermes profile created for that guest. Its tool calls go
+  through a server on `127.0.0.1` that checks the guest's warrant before anything runs.
+- **Your configuration.** When you press **Enable sharing**, Hermes Guests adds itself
+  to your Telegram tools if you chose them explicitly. Guest profiles are created and,
+  when you delete a guest's data, removed.
+- **Keys and records.** Signing keys, warrants, access records, receipts and activity
+  are stored in the plugin's own data folder. Signing happens on this machine; see the
+  [trust model](docs/authorization.md#trust-model-built-for-ease-of-use).
+- **Network.** Hermes Guests makes no network calls of its own beyond your model
+  provider, through Hermes, and Telegram. Shared tools reach whatever services they
+  already use. Nothing is reported anywhere.
+- **Credentials.** Model keys come from your Hermes profile, and a Codex sign-in is used
+  through Hermes without the plugin holding the token.
+
+## Removing Hermes Guests
+
+`hermes plugins remove hermes-guests` stops the plugin, but it leaves guest data and
+keys in place in case you reinstall. To remove everything:
+
+1. **End each guest's access and delete their data first.** In Telegram, send
+   `/guests`, open each guest, and press **End and delete data**. This removes their
+   `guests-*` Hermes profile, their conversations and their memories. Do this before
+   removing the plugin, because nothing else will clean those profiles up afterwards.
+2. **Remove the plugin:** `hermes plugins remove hermes-guests`, then restart the
+   gateway.
+3. **Delete its data folder:** `plugin-data/agent-plugin-hermes-guests-*` inside your
+   Hermes profile. It holds the signing keys, warrants, access records and activity.
+   Keep a copy if you want the activity history.
+4. **Free the dependencies:** `hermes pm gc` removes packages nothing uses any more.
+   Don't delete files under `installs/` by hand; if something looks wrong there, run
+   `hermes pm repair`.
+
+If a `guests-*` profile is still listed by `hermes profile list` after step 1, remove it
+with `hermes profile delete <name>`.
+
 ## Contribute
 
-Try the [sharing scenarios](docs/human-test.md),
+Try the [sharing scenarios](docs/scenarios.md),
 [report an issue](https://github.com/tenuo-ai/hermes-guests/issues), or read
 [CONTRIBUTING.md](CONTRIBUTING.md) to work on the code.
 
