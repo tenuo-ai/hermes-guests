@@ -27,15 +27,17 @@ Your ordinary Hermes commands remain available in your owner chat.
 | --- | --- |
 | `/help` | Show current permissions and access controls. |
 | `/access` | Show approved permissions, end time and access status. |
-| `/renew` | Request more time for active, time-limited access. Expired guests can use the renewal button. The owner reviews the request. |
+| `/renew` | Request more time. While access is on it's added to the current end; after it ends it runs from approval. The owner reviews the request. |
 | `/new` | Start a fresh conversation, keeping current permissions and authorized saved preferences. |
-| `/cancel` | Cancel a pending text request for more access. |
+| `/timezone <city or zone>` | Show times in your own time zone, for example `/timezone Vancouver`. |
+| `/cancel` | Cancel a pending request for more access or more time. |
 | `/start` | Open the invitation when following its link, or show the guest's permissions once joined. |
 
 Guests can also say “What can I do?” or “Request access to …”, and use
 **Request more access** or **Request more time**. Access changes require owner
-approval. A guest can have one request open at a time and make three a day, for
-more access and for more time alike. After access is ended, the owner can send a
+approval. A guest can have one request open at a time. Only requests the owner
+declines count: after three declines in a day, for more access or more time alike,
+the guest waits until the next day. After access is ended, the owner can send a
 new invitation.
 
 ## Never-share list

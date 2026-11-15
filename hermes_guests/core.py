@@ -28,6 +28,7 @@ from .audit import Audit
 from .model import (
     CHAT_ONLY_CAPABILITY,
     GUEST_MEMORY_CAPABILITY,
+    MAX_ACCESS_SECONDS,
     GuestsError,
     digest,
     iso,
@@ -48,7 +49,7 @@ URL_RULE = 'value.size() >= 1 && value.size() <= 5 && value.all(u, u.startsWith(
 SERVICE_TOOLS = {"ha_get_state", "ha_call_service", "web_search", "web_extract"}
 # The owner's own signed grant lasts a week and is reissued for the same tools before it
 # runs out, so the owner is not asked to repeat setup.
-MORE_PER_DAY = 3  # times a guest may ask the owner for more access in a day
+MORE_PER_DAY = 3  # declined requests for more after which a guest waits a day
 
 
 def open_request(record):
@@ -203,18 +204,22 @@ class GuestsService:
         tool_resolver=None,
         review_seconds=600,
         invitation_seconds=1800,
-        claim_seconds=600,
+        claim_seconds=86400,
         guest_data_retention_seconds=None,
+        activity_retention_days=90,
+        guest_names="yours",
     ):
         if not str(owner_id).isdigit():
             raise GuestsError("Sharing needs a verified Telegram owner before setup.")
-        for name, seconds in (
-            ("review_seconds", review_seconds),
-            ("invitation_seconds", invitation_seconds),
-            ("claim_seconds", claim_seconds),
+        # A review is answered now or not at all. An invitation and the owner's account
+        # check may wait for someone arriving at the weekend, but never past a fixed end.
+        for name, seconds, longest in (
+            ("review_seconds", review_seconds, 86400),
+            ("invitation_seconds", invitation_seconds, MAX_ACCESS_SECONDS),
+            ("claim_seconds", claim_seconds, MAX_ACCESS_SECONDS),
         ):
-            if type(seconds) is not int or not 60 <= seconds <= 86400:
-                raise GuestsError(f"{name} must be between 60 and 86400 seconds.")
+            if type(seconds) is not int or not 60 <= seconds <= longest:
+                raise GuestsError(f"{name} must be between 60 and {longest} seconds.")
             setattr(self, name, seconds)
         if guest_data_retention_seconds is not None and (
             type(guest_data_retention_seconds) is not int
@@ -222,6 +227,11 @@ class GuestsService:
         ):
             raise GuestsError("Guest data retention must be between zero and 365 days.")
         self.default_retention_seconds = guest_data_retention_seconds
+        if guest_names not in {"yours", "telegram"}:
+            raise GuestsError("guest_names must be yours or telegram.")
+        # Whose name for a guest the owner sees: the one the owner gave them, or the name
+        # on their Telegram account once they join.
+        self.guest_names = guest_names
         self.tool_resolver = tool_resolver or (lambda _name: None)
         self.owner_id = str(owner_id)
         self.ledger = Ledger(state)
@@ -233,7 +243,11 @@ class GuestsService:
         initialized = self.ledger.snapshot()["setup"].get("initialized", False)
         self.issuer = load_key(self.root / "control" / "issuer.key", create=not initialized)
         self.audit_key = load_key(self.root / "control" / "audit.key", create=not initialized)
-        self.audit = Audit(self.root, self.audit_key, self.issuer.public_key)
+        if type(activity_retention_days) is not int or not 1 <= activity_retention_days <= 3650:
+            raise GuestsError("Activity retention must be between 1 and 3650 days.")
+        self.audit = Audit(
+            self.root, self.audit_key, self.issuer.public_key, activity_retention_days
+        )
         self.guard = HermesGuard(
             trusted_roots=[self.issuer.public_key],
             require_session_warrant=True,
@@ -534,7 +548,17 @@ class GuestsService:
             raise GuestsError(
                 "Choose either a resource preset or explicit permissions for the same tool."
             )
+        # A length of time ("15 minutes") is what the owner approves, and it starts when the
+        # grant is signed: on approval, or when the owner confirms a new guest's account.
+        # The end shown in a review is where it would fall if approved then.
+        duration = value.get("duration_seconds") if parent is None else None
+        if saved and duration is not None:
+            value.pop("duration_seconds")
+            if not value.get("until_ended"):
+                value["expires_at"] = iso(self.clock() + duration)
         normalized = scope(value, now=self.clock(), catalog=self.catalog, parent=parent)
+        if duration is not None and not normalized.get("until_ended"):
+            normalized["duration_seconds"] = duration
         current_bindings = {}
         from .permissions import validate_schema
 
@@ -551,6 +575,78 @@ class GuestsService:
             )
         normalized["preset_schemas"] = current_bindings
         return normalized
+
+    NOTICE_MARKS = {
+        "ending": "ending_notice",
+        "ended": "ended_notice",
+        "owner_ended": "owner_notice",
+    }
+
+    def due_notices(self, warn_seconds=180):
+        """Notices not yet delivered: the guest's warning before access ends, the guest's
+        notice that it ended, and the owner's. Each is sent once per grant, and only marked
+        by ack_notice after it was delivered, so a failed send is tried again on the next
+        pass. Access of five minutes or less gets no warning."""
+        now, due = self.clock(), []
+        for r in self.ledger.snapshot()["shares"].values():
+            if r.get("status") != "active" or r["scope"].get("until_ended"):
+                continue
+            left = timestamp(r["scope"]["expires_at"]) - now
+            grant = r["warrant_id"]
+            if (
+                0 < left <= warn_seconds
+                and r.get("ending_notice") != grant
+                # Short access (five minutes or less from when this grant started) gets
+                # only the notice that it ended.
+                and timestamp(r["scope"]["expires_at"]) - r.get("updated_at", 0) > 300
+            ):
+                due.append(("ending", copy.deepcopy(r)))
+            elif left <= 0 and (r.get("notices") or left > -3600):
+                # Kept until delivered; grants from before delivery was tracked only
+                # within the first hour, so an upgrade doesn't announce long-past ends.
+                for kind in ("ended", "owner_ended"):
+                    if r.get(self.NOTICE_MARKS[kind]) != grant:
+                        due.append((kind, copy.deepcopy(r)))
+        return due
+
+    def notice_still_due(self, kind, record):
+        """Whether a notice read a moment ago still applies: the same grant, not since
+        renewed or changed, and not already delivered."""
+        r = self.ledger.snapshot()["shares"].get(record["id"])
+        if kind == "ending" and timestamp(record["scope"]["expires_at"]) <= self.clock():
+            return False  # too late to warn; the notice that it ended follows
+        return bool(
+            r
+            and r["warrant_id"] == record["warrant_id"]
+            and r.get("status") == "active"
+            and r["scope"].get("expires_at") == record["scope"].get("expires_at")
+            and r.get(self.NOTICE_MARKS[kind]) != record["warrant_id"]
+        )
+
+    def ack_notice(self, kind, record):
+        """A notice from due_notices was delivered: it is not sent again for this grant."""
+        with self.ledger.transaction() as db:
+            r = db["shares"].get(record["id"])
+            if r and r["warrant_id"] == record["warrant_id"]:
+                r[self.NOTICE_MARKS[kind]] = record["warrant_id"]
+
+    def default_invitation_seconds(self, access):
+        """Short access is usually for someone at hand; a day or more is for someone who
+        may open the link hours later."""
+        long = (
+            access.get("until_ended")
+            or (access.get("duration_seconds") or timestamp(access["expires_at"]) - self.clock())
+            >= 86400
+        )
+        return max(self.invitation_seconds, 86400) if long else self.invitation_seconds
+
+    @staticmethod
+    def _latest_start(access):
+        """The last moment reviewed access can still begin. A length of time starts when it
+        is signed, so only a fixed end time limits it."""
+        if access.get("duration_seconds") is not None or access.get("until_ended"):
+            return float("inf")
+        return timestamp(access["expires_at"])
 
     def _fresh(self, record):
         # Access with no end date stays active; its signed grant is issued again as needed.
@@ -701,8 +797,12 @@ class GuestsService:
         revision=None,
         retention_seconds=None,
         renewal=None,
+        more_seconds=None,
+        guest_zone=None,
     ):
         self.owner(actor)
+        if guest_zone is not None:
+            guest_zone = self.valid_zone(guest_zone)
         if not isinstance(label, str) or not 1 <= len(label.strip()) <= 80:
             raise GuestsError("Give this person a short name.")
         if action not in {"replace", "revoke", "delete", "retention"}:
@@ -718,8 +818,11 @@ class GuestsService:
         elif action in {"revoke", "delete"} and not share_id:
             raise GuestsError("Choose whose access to end.")
         if invitation_seconds is not None:
-            if type(invitation_seconds) is not int or not 60 <= invitation_seconds <= 86400:
-                raise GuestsError("Choose an invitation window between a minute and one day.")
+            if (
+                type(invitation_seconds) is not int
+                or not 60 <= invitation_seconds <= MAX_ACCESS_SECONDS
+            ):
+                raise GuestsError("Choose an invitation window between a minute and 30 days.")
             if share_id or action == "revoke":
                 raise GuestsError("Only new invitations need an acceptance window.")
         with self.ledger.transaction() as db:
@@ -753,11 +856,18 @@ class GuestsService:
                 "valid_until": self.clock() + self.review_seconds,
                 "status": "pending",
                 **(
-                    {"invitation_seconds": invitation_seconds or self.invitation_seconds}
+                    {
+                        "invitation_seconds": invitation_seconds
+                        or self.default_invitation_seconds(normalized)
+                    }
                     if not share_id and action == "replace"
                     else {}
                 ),
             }
+            if more_seconds:  # time added to the current end, said as such on the review
+                proposal["more_seconds"] = int(more_seconds)
+            if guest_zone:
+                proposal["guest_zone"] = guest_zone
             if old:
                 # A review of someone's existing access is for that account and no other,
                 # whatever the saved record names by the time it is approved.
@@ -822,7 +932,9 @@ class GuestsService:
             )
         text = review(proposal["label"], proposal["scope"], self.catalog, self.zone)
         if "invitation_seconds" in proposal:
-            text += "\n\n" + self.invitation_window_text(proposal["invitation_seconds"])
+            text += "\n\n" + self.invitation_window_text(
+                proposal["invitation_seconds"], proposal.get("scope")
+            )
         return self.returns_notice(proposal) + text
 
     @staticmethod
@@ -846,12 +958,11 @@ class GuestsService:
             + who
             + ". Their access "
             + ("was ended" if back.get("ended") else "ran out")
-            + ". No invitation is sent and the account is not confirmed again. "
-            "To share with a different account, cancel and use another name.\n\n"
+            + ". No invitation is sent and the account is not confirmed again.\n\n"
         )
 
     @staticmethod
-    def invitation_window_text(seconds):
+    def invitation_window_text(seconds, access=None):
         hours, remainder = divmod(seconds, 3600)
         minutes, leftover = divmod(remainder, 60)
         parts = []
@@ -861,7 +972,16 @@ class GuestsService:
         return (
             "Invitation may be opened within "
             + " ".join(parts)
-            + " after sending, before access ends. You'll then confirm the guest's account."
+            + " after sending"
+            + (
+                ", or until access ends if that comes first"
+                if access
+                and access.get("expires_at")
+                and not access.get("duration_seconds")
+                and not access.get("until_ended")
+                else ""
+            )
+            + ". You'll then confirm the guest's account, and their time starts."
         )
 
     def approve(self, actor, proposal_id):
@@ -879,6 +999,12 @@ class GuestsService:
                             "That review was already applied and access has since changed. Check /guests."
                         )
                 return result
+            if p["status"] == "superseded":
+                raise GuestsError(
+                    "You already approved a newer change to "
+                    + p["label"]
+                    + "'s access, so this one no longer applies."
+                )
             if p["status"] != "pending" or p["valid_until"] <= self.clock():
                 raise GuestsError("This review has ended. Ask Hermes to prepare it again.")
             # Digest binds exactly what the owner reviewed, excluding later result/status fields.
@@ -940,7 +1066,13 @@ class GuestsService:
                     )
                     # The guest's own words and Telegram name go with their data. Who it was
                     # (the ID) and what you called them stay, for the audit record.
-                    for theirs in ("more_open", "more_asked", "telegram_name", "telegram_username"):
+                    for theirs in (
+                        "more_open",
+                        "more_asked",
+                        "telegram_name",
+                        "telegram_username",
+                        "guest_zone",
+                    ):
                         record.pop(theirs, None)
                     self._clear(record["id"])
                     deleted.append(record["id"])
@@ -987,7 +1119,7 @@ class GuestsService:
                     "proposal_id": proposal_id,
                     "expires_at": min(
                         self.clock() + p.get("invitation_seconds", self.invitation_seconds),
-                        timestamp(p["scope"]["expires_at"]),
+                        self._latest_start(p["scope"]),
                     ),
                     "status": "open",
                 }
@@ -998,6 +1130,16 @@ class GuestsService:
                     "expires_at": iso(db["invites"][token_hash(invite)]["expires_at"]),
                 }
             p["status"] = "approved"
+            if p["share_id"]:
+                # Other reviews of this person's access were prepared against what it was
+                # before; approving them would be refused, so they stop being offered.
+                for other in db["proposals"].values():
+                    if (
+                        other is not p
+                        and other.get("share_id") == p["share_id"]
+                        and other["status"] == "pending"
+                    ):
+                        other["status"] = "superseded"
             # Never persist the raw invitation; retries cannot leak/recreate one.
             p["result"] = {k: v for k, v in result.items() if k != "token"}
             self.audit.event(
@@ -1073,7 +1215,7 @@ class GuestsService:
                 "proposal_id": proposal_id,
                 "expires_at": min(
                     self.clock() + p.get("invitation_seconds", self.invitation_seconds),
-                    timestamp(p["scope"]["expires_at"]),
+                    self._latest_start(p["scope"]),
                 ),
                 "status": "open",
             }
@@ -1106,6 +1248,10 @@ class GuestsService:
 
     def maintenance(self, actor):
         self.owner(actor)
+        try:
+            self.audit.upkeep(self.clock())
+        except OSError:
+            pass  # activity cleanup is retried on the next pass
         with self.ledger.transaction() as db:
             try:
                 self._keep_owner(db)
@@ -1137,13 +1283,65 @@ class GuestsService:
                     db["invites"].pop(key)
         return self.runner.cleanup(actor) if self.runner else []
 
-    def deny(self, actor, proposal_id):
+    @staticmethod
+    def valid_zone(zone):
+        """An IANA time zone name such as America/Vancouver, or GuestsError."""
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        zone = str(zone or "").strip()
+        try:
+            if not zone or len(zone) > 64:
+                raise ValueError
+            ZoneInfo(zone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise GuestsError(
+                "Use a time zone such as America/Vancouver or Europe/London."
+            ) from exc
+        return zone
+
+    def zone_of(self, record):
+        """The time zone for messages a guest reads: theirs if known, else the owner's."""
+        zone = (record or {}).get("guest_zone")
+        try:
+            return self.valid_zone(zone) if zone else self.zone
+        except GuestsError:
+            return self.zone
+
+    def set_guest_zone(self, actor, share_id, zone):
+        """A guest says where they are. It changes only how times are shown to them."""
+        zone = self.valid_zone(zone)
+        with self.ledger.transaction() as db:
+            r = self._record(db, share_id)
+            if r["guest_id"] != str(actor) or not self._fresh(r):
+                raise GuestsError("Only a guest with current access can set their time zone.")
+            r["guest_zone"] = zone
+        self.audit.event("guest_time_zone", share_id=share_id, actor=str(actor), zone=zone)
+        return {"time_zone": zone}
+
+    def deny(self, actor, proposal_id, *, declined=True):
         self.owner(actor)
         with self.ledger.transaction() as db:
             p = db["proposals"].get(proposal_id)
             if p and p["status"] == "pending":
                 p["status"] = "denied"
+                if declined and p.get("renewal") and p.get("share_id") in db["shares"]:
+                    self._declined(db["shares"][p["share_id"]])
         return {"status": "denied"}
+
+    def _declined(self, record):
+        """The owner said no to a request for more. Only these count toward the daily limit:
+        a guest whose requests are approved, or simply not answered, can ask again."""
+        now = self.clock()
+        record["declined"] = [t for t in record.get("declined", []) if t > now - 86400] + [now]
+
+    def _declined_today(self, db, guest_id):
+        day = self.clock() - 86400
+        return sum(
+            t > day
+            for r in db["shares"].values()
+            if r["guest_id"] == str(guest_id)
+            for t in r.get("declined", [])
+        )
 
     def claim(self, token, actor, label, *, username=""):
         if not str(actor).isdigit() or str(actor) == self.owner_id:
@@ -1155,7 +1353,7 @@ class GuestsService:
             if any(r["guest_id"] == str(actor) and self._fresh(r) for r in db["shares"].values()):
                 raise GuestsError("You already have an access record. Ask the owner to update it.")
             proposal = db["proposals"][inv["proposal_id"]]
-            if timestamp(proposal["scope"]["expires_at"]) <= self.clock() + 5:
+            if self._latest_start(proposal["scope"]) <= self.clock() + 5:
                 raise GuestsError("The proposed access has expired.")
             inv.update(
                 status="claimed",
@@ -1163,14 +1361,14 @@ class GuestsService:
                 guest_label=str(label)[:80],
                 guest_username=str(username)[:80],
                 claim_until=min(
-                    self.clock() + self.claim_seconds, timestamp(proposal["scope"]["expires_at"])
+                    self.clock() + self.claim_seconds, self._latest_start(proposal["scope"])
                 ),
             )
             return {
                 "claim_id": token_hash(token),
                 "guest_id": str(actor),
                 "guest_label": str(label)[:80],
-                "text": review(str(label)[:80], proposal["scope"], self.catalog, self.zone),
+                "text": review(proposal["label"], proposal["scope"], self.catalog, self.zone),
             }
 
     def accept_claim(self, actor, claim_id, *, accept=True):
@@ -1207,6 +1405,8 @@ class GuestsService:
             p = {**proposal}
             result = self._activate(db, sid, inv["guest_id"], p)
             db["shares"][sid]["telegram_name"] = inv["guest_label"]
+            if self.guest_names == "telegram" and inv["guest_label"].strip():
+                db["shares"][sid]["label"] = inv["guest_label"].strip()[:80]
             db["shares"][sid]["telegram_username"] = inv.get("guest_username", "")
             inv["status"] = "used"
             inv["share_id"] = sid
@@ -1226,6 +1426,7 @@ class GuestsService:
         if db["shares"].get(share_id, {}).get("data_deletion_requested_at") is not None:
             raise GuestsError("This guest data is being deleted. Create a new invitation.")
         access = self.normalize_scope(proposal["scope"], saved=True)
+        duration = access.pop("duration_seconds", None) or proposal.get("more_seconds")
         self._representable(access, guest=guest_id)
         # This path is reachable only after the owner accepts a complete new review.
         # A lost guest holder can be replaced here; automatic repair never remints it.
@@ -1263,19 +1464,32 @@ class GuestsService:
             "artifact_hash": hashlib.sha256(wire).hexdigest(),
             "old_warrants": history,
             "updated_at": self.clock(),
-            # A change to someone's access is not an answer to their request for more, and
-            # does not give them a fresh allowance of requests.
+            # How long the owner last chose, so a renewal can offer the same again.
+            **(
+                {"duration_seconds": duration}
+                if duration
+                else {"duration_seconds": old["duration_seconds"]}
+                if old and old.get("duration_seconds")
+                else {}
+            ),
+            # A change the owner approves answers an open request for more: what they have
+            # now is the owner's answer, and they can ask again. Declines stay counted.
             **{
                 k: old[k]
                 for k in (
                     "more_asked",
-                    "more_open",
+                    "declined",
+                    "guest_zone",
                     "renewals_asked",
                     "telegram_name",
                     "telegram_username",
                 )
                 if old and k in old
             },
+            **({"guest_zone": proposal["guest_zone"]} if proposal.get("guest_zone") else {}),
+            "notices": 1,  # end notices are retried until delivered
+            # When the owner last approved this access; automatic reissue doesn't move it.
+            "changed_at": self.clock(),
             "context_epoch": (old.get("context_epoch", 1) if old else 1)
             + (
                 1
@@ -1416,7 +1630,9 @@ class GuestsService:
             raise GuestsError("You don't have approved access. Ask the owner for an invitation.")
         return max(own, key=lambda r: r["updated_at"])
 
-    def renewal(self, actor, share_id):
+    def renewal(self, actor, share_id, seconds=None):
+        """A guest asks for more time: by default the length the owner last chose, from
+        when the owner approves. The owner can change it before approving."""
         record = self.get_access(actor, share_id)
         if record["guest_id"] != str(actor):
             raise GuestsError("Only the guest may request renewal.")
@@ -1424,6 +1640,11 @@ class GuestsService:
             raise GuestsError("This access was revoked. Ask the owner for a new invitation.")
         if record["status"] == "active" and record["scope"].get("until_ended"):
             raise GuestsError("Your access has no end date, so there is nothing to renew.")
+        # Checked before anything is recorded, so a corrected request can follow at once.
+        if seconds is None:
+            seconds = record.get("duration_seconds") or 86400
+        if type(seconds) is not int or not 60 <= seconds <= 30 * 86400:
+            raise GuestsError("Ask for between a minute and 30 days.")
         with self.ledger.transaction() as db:
             r = self._record(db, share_id)
             # The limits are the person's, not one access's: someone who has had access
@@ -1442,27 +1663,38 @@ class GuestsService:
             if waiting:
                 raise GuestsError("The owner has not answered your last request for more time yet.")
             day = self.clock() - 86400
-            if sum(at > day for x in theirs for at in x.get("renewals_asked", [])) >= MORE_PER_DAY:
+            if self._declined_today(db, r["guest_id"]) >= MORE_PER_DAY:
                 raise GuestsError(
-                    "You have asked a few times today. Try again tomorrow, or talk to the owner directly."
+                    "The owner said no a few times today. Try again tomorrow, or talk to them directly."
                 )
             asked = self.clock()
             r["renewals_asked"] = [at for at in r.get("renewals_asked", []) if at > day] + [asked]
             r["renewal_requested"] = asked
-        access = {
-            **record["scope"],
-            "expires_at": iso(
-                min(
-                    max(timestamp(record["scope"]["expires_at"]), self.clock()) + 86400,
-                    self.clock() + 30 * 86400,
-                )
-            ),
-        }
+        access = {**record["scope"]}
+        # More time never changes private memory: saved scopes leave out a false flag,
+        # which a new review would otherwise read as switched on.
+        access["guest_memory"] = bool(record["scope"].get("guest_memory"))
+        if not access.get("until_ended"):
+            end = timestamp(access["expires_at"]) if access.get("expires_at") else 0
+            if self._fresh(record) and end > self.clock():
+                # Still on: more time is added to the current end, so nothing is lost by
+                # asking early. A fixed new end, unchanged by when the owner answers.
+                access["expires_at"] = iso(end + seconds)
+            else:
+                access["duration_seconds"] = seconds
+                access.pop("expires_at", None)
         access.pop("preset_schemas", None)
         access["tools"] = tool_selections(access.get("tools", []))
         try:
             return self.prepare(
-                self.owner_id, record["label"], access, share_id=share_id, renewal=asked
+                self.owner_id,
+                record["label"],
+                access,
+                share_id=share_id,
+                renewal=asked,
+                more_seconds=seconds if access.get("expires_at") else None,
+                # Built from this revision: a change made meanwhile needs a fresh request.
+                revision=record["revision"],
             )
         except Exception:
             # No review came of it, so the owner was asked nothing: it is not one of the
@@ -1929,9 +2161,9 @@ class GuestsService:
                 raise GuestsError("The owner has not answered your last request yet.")
             now = self.clock()
             asked = [t for t in r.get("more_asked", []) if t > now - 86400]
-            if len(asked) >= MORE_PER_DAY:
+            if self._declined_today(db, r["guest_id"]) >= MORE_PER_DAY:
                 raise GuestsError(
-                    "You have asked a few times today. Try again tomorrow, or talk to the owner directly."
+                    "The owner said no a few times today. Try again tomorrow, or talk to them directly."
                 )
             token = secrets.token_urlsafe(6)
             r["more_asked"] = asked + [now]
@@ -1948,7 +2180,7 @@ class GuestsService:
                 r.pop("more_open")
                 r["more_asked"] = list(r.get("more_asked", []))[:-1]
 
-    def answer_more_request(self, actor, share_id, token):
+    def answer_more_request(self, actor, share_id, token, *, declined=False):
         """The owner answered one request, either way. Only that request's own buttons
         can do this; an older card answers nothing. Returns the access record."""
         self.owner(actor)
@@ -1957,6 +2189,8 @@ class GuestsService:
             if open_request(r).get("token") != token:
                 raise GuestsError("That request was already answered.")
             r.pop("more_open")
+            if declined:
+                self._declined(r)
             return copy.deepcopy(r)
 
     def open_requests(self, actor):
@@ -2043,16 +2277,18 @@ class GuestsService:
                 "never_share_changed", share_id="owner", actor=str(actor), change="remove word"
             )
 
-    def activity(self, actor, share_id=None, *, scope="guest", limit=50):
-        if type(limit) is not int or not 1 <= limit <= 100:
-            raise GuestsError("Choose between 1 and 100 recent activity events.")
+    def activity(self, actor, share_id=None, *, scope="guest", limit=50, since=None):
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise GuestsError("Choose between 1 and 1000 recent activity events.")
         if not isinstance(scope, str) or scope not in {"guest", "owner", "all"}:
             raise GuestsError("Choose guest, owner or all activity.")
         if scope in {"owner", "all"}:
             self.owner(actor)
-            return self.audit.list(None, limit, actor=self.owner_id if scope == "owner" else None)
+            return self.audit.list(
+                None, limit, actor=self.owner_id if scope == "owner" else None, since=since
+            )
         self.get_access(actor, share_id)
-        return self.audit.list(share_id, limit)
+        return self.audit.list(share_id, limit, since=since)
 
     def repair(self, actor):
         self.owner(actor)
