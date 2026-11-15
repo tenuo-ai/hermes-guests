@@ -136,75 +136,129 @@ def scope(value, *, now, catalog, parent=None):
     return result
 
 
-def simple_access(access, catalog, zone="UTC"):
+def when(value, zone="UTC"):
+    """A moment as people read it, in their own clock: "Fri 13 Nov, 11:52 PM EST"."""
     from zoneinfo import ZoneInfo
 
-    from .permissions import short_label
-    from .presentation import action_words, choices, constraint_text
+    at = datetime.fromtimestamp(timestamp(value), ZoneInfo(zone))
+    return at.strftime("%a %d %b, %I:%M %p %Z").replace(" 0", " ")
+
+
+def length_text(seconds):
+    """A length of time in words: "15 minutes", "2 hours 30 minutes", "7 days"."""
+    seconds = int(seconds)
+    parts = []
+    for size, unit in ((86400, "day"), (3600, "hour"), (60, "minute"), (1, "second")):
+        amount, seconds = divmod(seconds, size)
+        if amount:
+            parts.append(f"{amount} {unit}{'s' if amount != 1 else ''}")
+    # Every unit, so an approved length is never shown shorter than it is.
+    return " ".join(parts) or "0 seconds"
+
+
+def parse_length(text):
+    """A length a person typed ("6 hours", "an hour", "1h30m", "2 days", "1 hour and 30
+    minutes") in seconds, or None. The whole message must be a length: alternatives,
+    negations, signs or other words are asked again rather than read as some length."""
+    import re
+
+    units = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+    text = text.casefold().strip().rstrip(".!")
+    text = re.sub(r"\b(an?|one)\s+(?=(min|hour|day|week))", "1 ", text)
+    component = r"(\d+(?:\.\d+)?)\s*(m|mins?|minutes?|h|hrs?|hours?|d|days?|w|weeks?)(?![a-z])"
+    found = re.findall(component, text)
+    rest = re.sub(component, " ", text)
+    filler = {"for", "please", "another", "more", "and", "just", "about", "of", "time"}
+    leftover = [w for w in re.split(r"[\s,]+", rest) if w and w not in filler]
+    if not found or leftover:
+        return None
+    total = sum(float(amount) * units[unit[0]] for amount, unit in found)
+    import math
+
+    if not math.isfinite(total) or total > 10 * 365 * 86400:
+        return None  # an absurd number is asked again, not turned into a length
+    return int(total) if total >= 60 else None
+
+
+def end_text(access, zone="UTC"):
+    """When access ends. A reviewed length starts when the owner approves."""
+    if access.get("until_ended"):
+        return "No end date. Access continues until the owner ends it."
+    if access.get("duration_seconds"):
+        import time
+
+        # Worked out when the card is shown, not when the review was prepared: a card
+        # shown again hours later still says where access would end if approved now.
+        return (
+            "Lasts "
+            + length_text(access["duration_seconds"])
+            + " from approval (until "
+            + when(time.time() + access["duration_seconds"], zone)
+            + " if approved now)"
+        )
+    return "Ends " + when(access["expires_at"], zone)
+
+
+def simple_access(access, catalog, zone="UTC", *, for_owner=True, name=None):
+    """Access in plain words, the same way for every tool: the assistant's explanation of
+    each tool and the resources it covers, by name. The owner also sees each tool's real
+    name. Ids, exact rules and tools' official descriptions are under Details."""
+    from .presentation import choices
 
     lines = []
     if access.get("chat_only"):
         lines.append("• Chat with the assistant.")
-    for entity in access.get("lights", []):
-        lines.append(
-            f"• Ask whether {catalog.get(entity, {}).get('name', entity)} is on, or turn it on or off."
-        )
+    # How many discovered resources share each name: a shared name keeps its id, so two
+    # different grants never read the same.
+    taken = {}
+    for item in catalog.values():
+        key = str(item.get("name") or "").casefold()
+        if key:
+            taken[key] = taken.get(key, 0) + 1
+
+    def named(value, label=None):
+        name = label or catalog.get(value, {}).get("name") or str(value)
+        return f"{name} ({value})" if taken.get(str(name).casefold(), 0) > 1 else name
+
+    for entity in access.get("lights", []):  # the lights preset
+        lines.append(f"• Ask whether {named(entity)} is on, or turn it on or off.")
     if access.get("research"):
         lines.append("• Search the web or read a public page.")
     for entry in access.get("tools", []):
         display = entry.get("presentation", {})
+        resource = display.get("resource")
+        labels = display.get("resource_labels", {})
+        written = (display.get("operation") or "").strip().rstrip(".")
+        own = " ".join(str(entry["schema"].get("description") or "").split())
+        # Without the assistant's words (the button flow), the tool's opening sentence.
+        text = written or own.split(". ", 1)[0].rstrip(".") or str(entry["name"]).replace("_", " ")
         for option in entry.get("alternatives") or [entry["constraints"]]:
-            ha_tool = entry["name"] in {"ha_get_state", "ha_call_service"}
-            resource = display.get("resource") or ("entity_id" if ha_tool else None)
-            action = display.get("action") or (
-                "service" if entry["name"] == "ha_call_service" else None
-            )
-            targets = choices(option.get(resource, {}))
-            actions = choices(option.get(action, {}))
-            description = display.get("operation") or short_label(
-                entry["schema"].get("description"), entry["name"]
-            )
-            if entry["name"] == "ha_get_state":
-                description = "Check the state"
-            if actions:
-                aliases = (
-                    {
-                        "media_play": "play",
-                        "media_pause": "pause",
-                        "media_stop": "stop",
-                    }
-                    if ha_tool
-                    else {}
-                )
-                description = action_words([aliases.get(value, value) for value in actions])
+            line = text
+            rule = option.get(resource, {}) if resource else {}
+            if not resource:
+                # No resource declared: a single fixed rule is what this grant is limited
+                # to, so two different grants never read the same.
+                fixed = [r for r in option.values() if choices(r)]
+                rule = fixed[0] if len(fixed) == 1 else {}
+            targets = choices(rule)
             if targets:
-                names = display.get("resource_labels", {})
-                connector = " of " if entry["name"] == "ha_get_state" else " on "
-                description += connector + ", ".join(names.get(value, value) for value in targets)
-            elif entry["name"] == "ha_get_state" and option.get(resource) == {"any": True}:
-                description += " of any Home Assistant device or sensor"
-            limits = [
-                (display.get("labels", {}).get(key) or key.replace("_", " "))
-                + ": "
-                + constraint_text(rule)
-                for key, rule in option.items()
-                if key
-                not in {
-                    resource if targets else None,
-                    action if actions else None,
-                    display.get("namespace") if targets else None,
-                }
-                and "any" not in rule
-            ]
-            if limits:
-                description += " (" + "; ".join(limits) + ")"
-            lines.append("• " + description[:1].upper() + description[1:].rstrip(".") + ".")
-    if access.get("until_ended"):
-        end = "Access continues until the owner ends it."
-    else:
-        at = datetime.fromtimestamp(timestamp(access["expires_at"]), ZoneInfo(zone))
-        end = "Ends " + at.strftime("%a %d %b, %I:%M %p %Z").replace(", 0", ", ")
-    return "\n".join(dict.fromkeys(lines)) + "\n\n" + end
+                line += " — " + ", ".join(named(v, labels.get(v)) for v in targets)
+            elif "any" in rule:
+                what = display.get("labels", {}).get(resource) or resource.replace("_", " ")
+                line += " — any " + what
+            line = "• " + line[:1].upper() + line[1:]
+            if for_owner:
+                # The tool's real name, so wording that says something else stands out.
+                line += " · " + str(entry["name"])
+            lines.append(line + ("" if for_owner else "."))
+    if access.get("guest_memory"):
+        # Whose memory: the guest's own, kept apart from the owner's.
+        whose = "your" if not for_owner else (f"{name}'s own" if name else "their own")
+        lines.append(
+            f"• Private memory: {whose} preferences are remembered between chats"
+            + (", kept apart from yours." if for_owner else ".")
+        )
+    return "\n".join(dict.fromkeys(lines)) + "\n\n" + end_text(access, zone)
 
 
 def guest_view(label, access, catalog, zone="UTC", inviter=None, *, detailed=False):
@@ -213,57 +267,53 @@ def guest_view(label, access, catalog, zone="UTC", inviter=None, *, detailed=Fal
     body = (
         review(label, access, catalog, zone)
         if detailed
-        else "Here’s what you can do:\n" + simple_access(access, catalog, zone)
+        else "Here’s what you can do:\n" + simple_access(access, catalog, zone, for_owner=False)
     )
     return welcome + body + "\n\nSend a message to start."
 
 
 def review(label, access, catalog, zone="UTC"):
-    from zoneinfo import ZoneInfo
-
-    end = datetime.fromtimestamp(timestamp(access["expires_at"]), ZoneInfo(zone))
-    lines = [f"Access for {label}", ""]
+    """The exact access, in sections: what they can do (every rule and each tool's own
+    description), when it ends, and what else is good to know."""
+    lines = [f"Exact access for {label}", "", "What they can do"]
     if access.get("chat_only"):
-        lines += ["Chat only. No enabled actions or subagents."]
-    if access["lights"]:
-        lines.append("Home Assistant")
-        for entity in access["lights"]:
-            lines.append(
-                f"• Read {catalog.get(entity, {}).get('name', entity)}'s state and details; turn it on and off."
-            )
-    if access["research"]:
-        lines += ["Web research", "• Search the public web and read public pages."]
+        lines.append("• Chat with the assistant only. No tools or subtasks.")
+    for entity in access.get("lights", []):
+        lines.append(
+            f"• {catalog.get(entity, {}).get('name', entity)}: check whether it's on, and turn it on or off."
+        )
+    if access.get("research"):
+        lines.append("• Search the public web and read public pages.")
     if access.get("tools"):
         from .presentation import review_tools
 
-        lines += ["Allowed actions", ""]
+        if lines[-1] != "What they can do":
+            lines.append("")
         lines += review_tools(access["tools"])
-    if lines[-1] != "":
-        lines.append("")
-    lines += [
-        "No end date. Access continues until the owner ends it."
-        if access.get("until_ended")
-        else "Ends " + end.strftime("%a %d %b %Y, %H:%M:%S %Z (UTC%z)"),
-        "",
-        "Access details",
-        "• Scope is limited to the capabilities and inputs above.",
+    while lines[-1] == "":
+        lines.pop()
+    lines += ["", "When it ends", end_text(access, zone)]
+    notes = [
         *(
             []
             if access.get("chat_only")
-            else ["• Subtasks may use narrower access for up to five minutes."]
+            else ["• Subtasks may use narrower parts of this for up to five minutes."]
         ),
         *(
-            ["• Private guest memory remembers preferences across conversations."]
+            [
+                f"• Private memory: {label}'s own preferences are remembered across conversations, kept apart from the owner's."
+            ]
             if access.get("guest_memory")
             else []
         ),
-        "• The owner can inspect tool attempts and results.",
         *(
-            ["• Tools may return broader data or have effects their input schemas do not describe."]
+            ["• Tools may return more data, or do more, than their inputs show."]
             if access.get("tools")
             else []
         ),
     ]
+    if notes:
+        lines += ["", "Good to know", *notes]
     return "\n".join(lines)
 
 
