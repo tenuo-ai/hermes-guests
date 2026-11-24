@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hermes-guests"
 version = "0.1.1"
-description = "Native Telegram per-person service sharing for Hermes"
+description = "Multi-user access for Hermes Agent: share your assistant on Telegram with separate memory and per-person permissions"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
