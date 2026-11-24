@@ -1,2 +1,2 @@
 hermes-tenuo==0.4.0
-tenuo==0.3.7
+tenuo==0.3.8
