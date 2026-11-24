@@ -1,8 +1,9 @@
 name: hermes-guests
 version: 0.1.1
 description: >-
-  Share selected services with Telegram guests through native confirmations,
-  isolated guest agents, and local Tenuo enforcement. Development preview.
+  Multi-user access for Hermes Agent. Share your assistant with family, friends
+  and teammates on Telegram, each with their own conversations and memory and
+  only the permissions you approve. Preview.
 author: Tenuo AI
 license: Apache-2.0
 kind: standalone

@@ -2,9 +2,7 @@
 
 [![Checks](https://github.com/tenuo-ai/hermes-guests/actions/workflows/checks.yml/badge.svg)](https://github.com/tenuo-ai/hermes-guests/actions/workflows/checks.yml)
 
-**Share your Hermes with guests, family and teammates.**
-
-They chat with your bot from their own Telegram and get only what you approve, for as long as you choose. Access ends on its own.
+**Multi-user access for Hermes Agent.** Share your Hermes with family, friends and teammates without handing over your whole assistant. Each person chats with your Telegram bot from their own account, gets their own conversations and memory, and can use only what you approve, for as long as you choose.
 
 ![You approve what Sam gets; Sam uses it from their own Telegram, asks for more, and you decide](docs/media/demo.gif)
 
@@ -19,7 +17,17 @@ For a chat-only invitation, try “Let Alex chat for a day with no tools.”
 
 **Why not just tell the bot who may do what?** Rules in a prompt can be talked around. Each guest's access is a signed, expiring [Tenuo](https://github.com/tenuo-ai/tenuo) warrant that only you can approve. The model can't sign or widen one, and Hermes Guests checks it in code before every guest turn and tool call. ([Trust model](docs/authorization.md#trust-model-built-for-ease-of-use))
 
-**Preview:** one owner, Telegram private text chats, Hermes 0.22.6 or later.
+## What you can do
+
+- **Let your partner use your assistant without seeing your chats.** Each guest gets a separate Hermes profile with its own conversations and memory. Your own history, memory, skills and files stay out of reach; guests see only what the tools you share return.
+- **Give a friend one thing, for a while.** The guest room light until Sunday, or your research tools for two days. Timed access ends on its own unless you extend it.
+- **Let a teammate look without changing anything.** Share only a tool's read actions, such as checking status or searching, when the tool keeps reading and changing separate.
+- **Invite someone just to chat**, with no tools at all.
+- **Stay in charge from your own chat.** See who has access and what they did, approve their requests for more, and end access at any time.
+
+It runs inside the Hermes you already have: no second install and no extra bot.
+
+**Preview:** one owner, Telegram private text chats, Hermes 0.22.6 or later. Group chats and other messaging apps aren't supported yet.
 
 ## Get started
 
