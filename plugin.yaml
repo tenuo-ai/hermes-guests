@@ -21,7 +21,7 @@ optional_env:
   - XAI_API_KEY
 python_dependencies:
   - "hermes-tenuo==0.4.0"
-  - "tenuo==0.3.7"
+  - "tenuo==0.3.8"
   - "jsonschema>=4.18,<5"
 provides_tools:
   - guests_discover

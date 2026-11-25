@@ -16,7 +16,7 @@ from tenuo import Exact, SigningKey, Warrant
 class ReleasedGuardTests(unittest.TestCase):
     def setUp(self):
         self.assertEqual(importlib.metadata.version("hermes-tenuo"), "0.4.0")
-        self.assertEqual(importlib.metadata.version("tenuo"), "0.3.7")
+        self.assertEqual(importlib.metadata.version("tenuo"), "0.3.8")
         self.issuer = SigningKey.generate()
         self.holder = SigningKey.generate()
         self.guard = HermesGuard(
