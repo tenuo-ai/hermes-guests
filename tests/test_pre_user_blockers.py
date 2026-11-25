@@ -755,11 +755,14 @@ class OwnerContinuityTests(unittest.TestCase):
         self.assertTrue(self.s.owner_ready())
         self.assertTrue(self.s.owner_configured())
 
+    @slow
     def test_the_owner_is_not_asked_to_repeat_setup_when_their_grant_runs_out(self):
-        # Real time, with a grant life of a few seconds standing in for the real week.
+        # Exercise renewal after real expiry, not the early-renewal window.
+        # A seven-second window on an eight-second grant can already be due
+        # at the first check because expiry has whole-second precision.
         with (
             patch("hermes_guests.core.OWNER_SECONDS", 8),
-            patch("hermes_guests.core.OWNER_RENEW", 7),
+            patch("hermes_guests.core.OWNER_RENEW", 0),
         ):
             self.s.setup_owner("100", {"guests_list_access": "x", "library_find": "y"})
             first = self.s.ledger.snapshot()["setup"]["owner_authority"]["warrant_id"]
